@@ -14,7 +14,6 @@ categories = ["asynchronous", "game-engines"]
 default = ["serde", "watch"]
 serde   = ["dep:typetag", "dep:serde", "dep:serde_json", "dep:serde_norway"]
 watch   = ["tokio/sync"]
-http    = ["dep:axum", "dep:futures"]
 lua     = ["dep:mlua", "serde"]
 
 [dependencies]
@@ -35,9 +34,6 @@ serde_norway = { version = "0.9", optional = true }
 # lua feature deps
 mlua = { version = "0.11", features = ["lua55", "vendored", "async", "send", "serde"], optional = true }
 
-# http feature deps
-axum = { version = "0.8", features = ["ws"], optional = true }
-futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

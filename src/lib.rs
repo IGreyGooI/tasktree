@@ -17,8 +17,6 @@ pub mod registry;
 pub mod tree_def;
 #[cfg(feature = "lua")]
 pub mod lua;
-// pub mod http_api;
-// pub mod websocket;
 pub mod poll;
 pub mod utils;
 pub mod runtime;
