@@ -1,96 +1,93 @@
-//! Link-time action and condition registry via the `inventory` crate.
+//! `BtRegistry<CTX>` — a simple HashMap-based action and condition registry.
 //!
-//! Register actions and conditions from any crate with `register_action!` /
-//! `register_condition!`. The runtime resolves names at tree-load time.
+//! The old `inventory`-based link-time registry is dropped because `inventory::collect!`
+//! requires a concrete (non-generic) type. With `AsyncBehaviorNode<CTX>` being generic
+//! over `CTX`, a link-time registry is not feasible.
+//!
+//! Instead, callers build a `BtRegistry<CTX>` and register factories explicitly before
+//! calling `NodeDef::into_tree(&registry)`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{condition::Condition, node::AsyncBehaviorNode};
+use crate::condition::Condition;
+use crate::node::AsyncBehaviorNode;
 
-// ── Action registry ──────────────────────────────────────────────────────────
+/// Factory function type for action nodes.
+pub type ActionFactory<CTX> = fn() -> Arc<dyn AsyncBehaviorNode<CTX>>;
 
-/// A registered action entry: a factory keyed by the node's own `name()`.
-pub struct ActionRegistration {
-    pub factory: fn() -> Arc<dyn AsyncBehaviorNode>,
-}
+/// Factory function type for condition nodes.
+pub type ConditionFactory<CTX> = fn() -> Arc<dyn Condition<CTX>>;
 
-inventory::collect!(ActionRegistration);
-
-/// Register an action node type so it can be resolved from YAML by name.
+/// Runtime registry mapping node names to factory functions.
 ///
-/// The `name` in YAML must match what `AsyncBehaviorNode::name()` returns.
-///
-/// ```ignore
-/// register_action!(|| Arc::new(MoveToTarget));
-/// ```
-#[macro_export]
-macro_rules! register_action {
-    ($factory:expr) => {
-        $crate::inventory::submit!($crate::registry::ActionRegistration {
-            factory: $factory,
-        });
-    };
-}
-
-// ── Condition registry ───────────────────────────────────────────────────────
-
-/// A registered condition entry.
-pub struct ConditionRegistration {
-    pub factory: fn() -> Arc<dyn Condition>,
-}
-
-inventory::collect!(ConditionRegistration);
-
-/// Register a condition type so it can be resolved from YAML by name.
-///
-/// The `name` in YAML must match what `Condition::name()` returns.
+/// Create one per `CTX` type, register all your action and condition factories,
+/// then pass `&registry` to `NodeDef::into_tree()`.
 ///
 /// ```ignore
-/// register_condition!(|| Arc::new(BatteryLow));
+/// let mut reg = BtRegistry::<EngineContext>::new();
+/// reg.register_action(|| Arc::new(MoveToTarget));
+/// reg.register_condition(|| Arc::new(HasTarget));
+/// let tree = NodeDef::from_yaml(yaml)?.into_tree(&reg)?;
 /// ```
-#[macro_export]
-macro_rules! register_condition {
-    ($factory:expr) => {
-        $crate::inventory::submit!($crate::registry::ConditionRegistration {
-            factory: $factory,
-        });
-    };
+pub struct BtRegistry<CTX> {
+    actions: HashMap<String, ActionFactory<CTX>>,
+    conditions: HashMap<String, ConditionFactory<CTX>>,
 }
 
-// ── Manifest ─────────────────────────────────────────────────────────────────
+impl<CTX: Send + Sync + 'static> BtRegistry<CTX> {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self {
+            actions: HashMap::new(),
+            conditions: HashMap::new(),
+        }
+    }
 
-/// All action names registered in the current binary.
-pub fn registered_actions() -> Vec<String> {
-    let mut names: Vec<String> = inventory::iter::<ActionRegistration>
-        .into_iter()
-        .map(|r| (r.factory)().name().to_string())
-        .collect();
-    names.sort_unstable();
-    names
+    /// Register an action factory.
+    ///
+    /// The factory is called once per `into_tree()` for each matching node.
+    /// The name key is derived from `factory().name()`.
+    pub fn register_action(&mut self, factory: ActionFactory<CTX>) {
+        let name = (factory)().name().to_string();
+        self.actions.insert(name, factory);
+    }
+
+    /// Register a condition factory.
+    ///
+    /// The name key is derived from `factory().name()`.
+    pub fn register_condition(&mut self, factory: ConditionFactory<CTX>) {
+        let name = (factory)().name().to_string();
+        self.conditions.insert(name, factory);
+    }
+
+    /// Resolve an action by name — returns `None` if not registered.
+    pub fn resolve_action(&self, name: &str) -> Option<Arc<dyn AsyncBehaviorNode<CTX>>> {
+        self.actions.get(name).map(|f| f())
+    }
+
+    /// Resolve a condition by name — returns `None` if not registered.
+    pub fn resolve_condition(&self, name: &str) -> Option<Arc<dyn Condition<CTX>>> {
+        self.conditions.get(name).map(|f| f())
+    }
+
+    /// All registered action names (sorted).
+    pub fn action_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.actions.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// All registered condition names (sorted).
+    pub fn condition_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.conditions.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
 }
 
-/// All condition names registered in the current binary.
-pub fn registered_conditions() -> Vec<String> {
-    let mut names: Vec<String> = inventory::iter::<ConditionRegistration>
-        .into_iter()
-        .map(|r| (r.factory)().name().to_string())
-        .collect();
-    names.sort_unstable();
-    names
-}
-
-/// Resolve an action by name — calls the matching factory.
-pub fn resolve_action(name: &str) -> Option<Arc<dyn AsyncBehaviorNode>> {
-    inventory::iter::<ActionRegistration>
-        .into_iter()
-        .map(|r| (r.factory)())
-        .find(|node| node.name() == name)
-}
-
-/// Resolve a condition by name — calls the matching factory.
-pub fn resolve_condition(name: &str) -> Option<Arc<dyn Condition>> {
-    inventory::iter::<ConditionRegistration>
-        .into_iter()
-        .map(|r| (r.factory)())
-        .find(|cond| cond.name() == name)
+impl<CTX: Send + Sync + 'static> Default for BtRegistry<CTX> {
+    fn default() -> Self {
+        Self::new()
+    }
 }

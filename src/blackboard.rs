@@ -30,6 +30,8 @@ pub trait BlackboardValue: Any + Send + Sync {
     /// Return `self` as `&mut dyn Any` for typed mutable downcasting.
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
+    fn as_box_any(self: Box<Self>) -> Box<dyn Any>;
+
     /// Clone this value into a new heap allocation.
     fn clone_box(&self) -> Box<dyn BlackboardValue>;
 }
@@ -107,6 +109,10 @@ where
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
     fn clone_box(&self) -> Box<dyn BlackboardValue> { Box::new(self.clone()) }
+    
+    fn as_box_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
 }
 
 // Blanket: Lua write-back for Serialize + DeserializeOwned + Clone types.
@@ -449,24 +455,15 @@ impl Blackboard {
 
     /// Remove a typed value. Panics if the key exists but type doesn't match.
     async fn remove_typed<T: BlackboardValue + 'static>(&self, key: &str) -> Option<T> {
-        self.remove_impl(key).await.and_then(|mut entry| {
-            match entry.value.as_any_mut().downcast_mut::<T>() {
-                Some(_) => {
-                    // We confirmed the type; now extract via clone and drop the entry.
-                    // (We can't move out of Box<dyn Trait> without unsafe, so clone.)
-                    let cloned = entry.value.as_any().downcast_ref::<T>().unwrap().clone_box();
-                    let any: Box<dyn Any + 'static> = unsafe {
-                        // SAFETY: we just confirmed the concrete type is T above.
-                        let raw = Box::into_raw(cloned) as *mut T;
-                        Box::from_raw(raw as *mut (dyn Any + 'static))
-                    };
-                    Some(*any.downcast::<T>().unwrap())
-                }
-                None => panic!(
+        self.remove_impl(key).await.and_then(|entry| {
+            let stored_type = entry.value.type_name();
+            match entry.value.as_box_any().downcast::<T>() {
+                Ok(value) => Some(*value),
+                Err(_) => panic!(
                     "Blackboard type mismatch for key '{}': expected type '{}', but found stored type '{}'",
                     key,
                     std::any::type_name::<T>(),
-                    entry.value.type_name()
+                    stored_type
                 ),
             }
         })

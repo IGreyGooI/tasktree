@@ -1,17 +1,106 @@
-//! `BehaviorTreeRuntime` — the tick-driven async behavior tree executor.
+//! `BehaviorTreeRuntime<CTX>` — tick-driven async behavior tree executor.
 //!
-//! ## Design
+//! # Quick start
 //!
-//! * The runtime owns `HashMap<NodeId, JoinHandle<ActionResult>>` for all
-//!   in-flight action nodes.
-//! * On `tick()` the tree is walked recursively via `eval()`.
-//! * First encounter of an action node: `poll_once` probes the future once.
-//!   - `Poll::Ready(r)` → completed synchronously, result this tick, no spawn.
-//!   - `Poll::Pending`  → spawn, return `Running` to parent.
-//! * Subsequent ticks with an existing handle: return `Running` (or collect the
-//!   result if the handle is finished).
-//! * `cancel_subtree` aborts all handles in the subtree (used by selector
-//!   preemption).
+//! ```rust,ignore
+//! use std::sync::Arc;
+//! use tasktree::{BehaviorTreeRuntime, Blackboard};
+//!
+//! // 1. Build a tree (or load YAML — see `from_yaml`).
+//! let tree = /* your BehaviorTreeNode<MyCtx> */;
+//!
+//! // 2. Create the runtime with a shared user context.
+//! let mut rt = BehaviorTreeRuntime::new(tree, Blackboard::new(), Arc::new(my_ctx));
+//!
+//! // 3. Drive it. One tick = one walk of the tree.
+//! loop {
+//!     match rt.tick().await {
+//!         NodeResult::Success | NodeResult::Failure => break,
+//!         NodeResult::Running => { /* sleep, then tick again */ }
+//!     }
+//! }
+//!
+//! // 4. Pre-empt mid-tree (e.g. external event changes the situation):
+//! rt.interrupt();           // cancels in-flight work, refreshes the token
+//! rt.tick().await;          // walks from root again
+//! ```
+//!
+//! # Writing an action node
+//!
+//! Implement [`AsyncBehaviorNode<CTX>`].  The single rule that matters:
+//!
+//! > **Do NOT `tokio::spawn` work and return `Success` early.**  Anything you
+//! > spawn outside the action future cannot be tracked by the runtime, cannot
+//! > be cancelled, and will keep running after the BT has moved on.  Just
+//! > `.await` your work inside `execute` — the runtime spawns the future for
+//! > you and stores the handle.
+//!
+//! ```rust,ignore
+//! #[async_trait]
+//! impl AsyncBehaviorNode<MyCtx> for SpeakToPlayer {
+//!     async fn execute(&self, ctx: AsyncExecutionContext<MyCtx>) -> ActionResult {
+//!         // Long async work — `.await` directly.  The runtime owns this future.
+//!         let dialogue = match call_llm(&ctx.user, &ctx.current_ct).await {
+//!             Ok(d) => d,
+//!             Err(_) => return ActionResult::Failure,
+//!         };
+//!         emit_event(&ctx.user, dialogue).await;
+//!         ActionResult::Success
+//!     }
+//!     fn name(&self) -> &str { "speak_to_player" }
+//! }
+//! ```
+//!
+//! ## Cancellation
+//!
+//! **Primary mechanism: `JoinHandle::abort()`.**  When `interrupt()` or
+//! `cancel()` is called, every in-flight action handle is aborted.  Tokio
+//! drops the future at its next `.await` point — no cooperation needed.
+//! Any action that is structured as `do_work().await; ActionResult::Success`
+//! is cancelled automatically because the future is dropped mid-stream.
+//!
+//! **`ctx.current_ct`** (a `CancellationToken`) serves two narrower roles:
+//!
+//! 1. **Tree traversal gate** — `eval()` checks `ctx.current_ct.is_cancelled()`
+//!    before evaluating each node.  After `cancel()` (where the token is
+//!    permanently fired), every subsequent `tick()` returns `Failure`
+//!    immediately without walking any children.
+//! 2. **Retry-loop fast-path** — if an action has a retry loop that calls a
+//!    fallible async helper, checking `ct.is_cancelled()` before each attempt
+//!    avoids starting new work after cancellation has been requested.
+//!
+//! Action nodes do **not** need to observe `ctx.current_ct` inside their main
+//! async body for cancellation to work.  `abort()` handles mid-work
+//! termination; checking the token is only useful for early-exit at the
+//! boundary of retry attempts.
+//!
+//! **Cleanup on cancel** — resource cleanup (e.g. sending a "stream closed"
+//! message to the frontend) must use a `Drop` impl on a local guard struct,
+//! NOT a `select!` on the token.  `Drop` runs on both normal return and
+//! `abort()`, so it is the only reliable cleanup hook.
+//!
+//! # Lifecycle
+//!
+//! * **Tick 1** — the runtime polls the action's future once.  If it returns
+//!   `Ready` immediately, that result is the action's result for the tick (no
+//!   spawn).  If it returns `Pending`, the runtime spawns it and stores the
+//!   handle keyed by `NodeId`; the action's parent sees `Running`.
+//! * **Tick N** — if the handle is still alive, the runtime returns `Running`
+//!   without re-entering `execute`.  Conditions earlier in the tree are still
+//!   re-evaluated on every tick; sibling branches after a `Running` action are
+//!   not walked (selector / sequence short-circuit).
+//! * **Completion** — the handle reports `Ready(ActionResult)`; the runtime
+//!   removes it from the map and bubbles the result up.
+//!
+//! [`Self::cancel`] permanently cancels the runtime.  [`Self::interrupt`] is
+//! the reusable variant — it aborts in-flight handles, fires the cancellation
+//! token, and installs a fresh token so the next `tick` runs cleanly.
+//!
+//! # CTX
+//!
+//! `CTX` is your engine context (world handle, NPC id, anything action nodes
+//! need).  It is stored as `Arc<CTX>` and cloned cheaply into every
+//! `AsyncExecutionContext`.  `CTX: Send + Sync + 'static`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,23 +117,30 @@ use crate::types::{ActionResult, AsyncExecutionContext, NodeResult, ParallelPoli
 
 /// Async behavior tree runtime.
 ///
-/// Create one per tree; share the `Blackboard` across runtimes if multiple
+/// Create one per tree. Share the `Blackboard` across runtimes if multiple
 /// trees need to communicate.
+///
+/// `CTX` is the engine-specific user context type.
 #[derive(Debug)]
-pub struct BehaviorTreeRuntime {
-    root: BehaviorTreeNode,
+pub struct BehaviorTreeRuntime<CTX> {
+    root: BehaviorTreeNode<CTX>,
     blackboard: Blackboard,
+    user: Arc<CTX>,
     cancellation_token: CancellationToken,
     /// In-flight action handles, keyed by stable `NodeId`.
     handles: HashMap<NodeId, JoinHandle<ActionResult>>,
 }
 
-impl BehaviorTreeRuntime {
-    pub fn new(mut root: BehaviorTreeNode, blackboard: Blackboard) -> Self {
+impl<CTX: Send + Sync + 'static> BehaviorTreeRuntime<CTX> {
+    /// Create a new runtime from a pre-built tree.
+    ///
+    /// `user` is the engine-specific context shared across all action nodes.
+    pub fn new(mut root: BehaviorTreeNode<CTX>, blackboard: Blackboard, user: Arc<CTX>) -> Self {
         root.stamp_ids(None, 0);
         Self {
             root,
             blackboard,
+            user,
             cancellation_token: CancellationToken::new(),
             handles: HashMap::new(),
         }
@@ -52,15 +148,40 @@ impl BehaviorTreeRuntime {
 
     /// Deserialize a tree from a YAML string and create a runtime.
     ///
-    /// Actions and conditions are resolved from the global registry
-    /// (populated via `register_action!` / `register_condition!`).
+    /// Actions and conditions are resolved from `registry`.
     ///
     /// # Errors
-    /// Returns a YAML parse error if the string is malformed.
+    /// Returns a YAML parse error if the string is malformed, or an unknown-action
+    /// error if the YAML references a name not in `registry`.
     #[cfg(feature = "serde")]
-    pub fn from_yaml(yaml: &str, blackboard: Blackboard) -> Result<Self, crate::error::RobotBTError> {
-        let tree = crate::tree_def::NodeDef::from_yaml(yaml)?.into_tree()?;
-        Ok(Self::new(tree, blackboard))
+    pub fn from_yaml(
+        yaml: &str,
+        blackboard: Blackboard,
+        user: Arc<CTX>,
+        registry: &crate::registry::BtRegistry<CTX>,
+    ) -> Result<Self, crate::error::RobotBTError> {
+        let tree = crate::tree_def::NodeDef::from_yaml(yaml)?.into_tree(registry)?;
+        Ok(Self::new(tree, blackboard, user))
+    }
+
+    /// Deserialize a tree from an XML string and create a runtime.
+    ///
+    /// Element name is the node type; attributes carry scalar fields.
+    /// `<true_branch>` / `<false_branch>` are wrapper elements for `Condition` branches.
+    /// Multiple children inside a branch wrapper are implicitly wrapped in a `Sequence`.
+    ///
+    /// # Errors
+    /// Returns an XML parse error if the string is malformed, or an unknown-action
+    /// error if the XML references a name not in `registry`.
+    #[cfg(feature = "xml")]
+    pub fn from_xml(
+        xml: &str,
+        blackboard: Blackboard,
+        user: Arc<CTX>,
+        registry: &crate::registry::BtRegistry<CTX>,
+    ) -> Result<Self, crate::error::RobotBTError> {
+        let tree = crate::tree_def::NodeDef::from_xml(xml)?.into_tree(registry)?;
+        Ok(Self::new(tree, blackboard, user))
     }
 
     /// Reference to the shared blackboard.
@@ -69,6 +190,9 @@ impl BehaviorTreeRuntime {
     }
 
     /// Cancel the entire tree and abort all in-flight action futures.
+    ///
+    /// After `cancel()` the runtime's cancellation token is permanently cancelled.
+    /// Call `interrupt()` instead if you want to resume ticking from the root.
     pub fn cancel(&mut self) {
         self.cancellation_token.cancel();
         for (_, handle) in self.handles.drain() {
@@ -76,9 +200,34 @@ impl BehaviorTreeRuntime {
         }
     }
 
+    /// Pre-empt the running tree so the next `tick()` walks fresh from the root.
+    ///
+    /// Aborts every in-flight action handle, fires the runtime's cancellation
+    /// token (so cooperative cancellation reaches anything inside actions that
+    /// is observing `ctx.current_ct`), then installs a fresh token.
+    ///
+    /// Use this when an external event changes the situation and the BT must
+    /// re-decide from the top — e.g. the player speaks to an NPC mid-roam.
+    /// In contrast, [`Self::cancel`] cancels permanently; subsequent ticks
+    /// would see the cancelled token and return `Failure` immediately.
+    pub fn interrupt(&mut self) {
+        // Cancel BT structural handles and replace the cancellation token.
+        self.cancel();
+        self.cancellation_token = CancellationToken::new();
+    }
+
     /// Execute one tick of the behavior tree.
+    ///
+    /// Walks the tree from the root, evaluating conditions and polling
+    /// in-flight action handles.  The `user` context is cloned (via `Arc`)
+    /// into the `AsyncExecutionContext` for this tick so action nodes and
+    /// conditions can read engine state.
     pub async fn tick(&mut self) -> NodeResult {
-        let ctx = AsyncExecutionContext::new(self.blackboard.clone(), self.cancellation_token.clone());
+        let ctx = AsyncExecutionContext::new(
+            self.blackboard.clone(),
+            self.cancellation_token.clone(),
+            Arc::clone(&self.user),
+        );
         eval(&self.root, &mut self.handles, ctx).await
     }
 
@@ -86,7 +235,7 @@ impl BehaviorTreeRuntime {
     ///
     /// Called by selector nodes when a higher-priority child succeeds and the
     /// currently-running lower-priority subtree should be preempted.
-    pub fn cancel_subtree(&mut self, subtree: &BehaviorTreeNode) {
+    pub fn cancel_subtree(&mut self, subtree: &BehaviorTreeNode<CTX>) {
         cancel_subtree_handles(subtree, &mut self.handles);
     }
 }
@@ -95,10 +244,10 @@ impl BehaviorTreeRuntime {
 // eval — recursive tree walker
 // ---------------------------------------------------------------------------
 
-fn eval<'a>(
-    node: &'a BehaviorTreeNode,
+fn eval<'a, CTX: Send + Sync + 'static>(
+    node: &'a BehaviorTreeNode<CTX>,
     handles: &'a mut HashMap<NodeId, JoinHandle<ActionResult>>,
-    ctx: AsyncExecutionContext,
+    ctx: AsyncExecutionContext<CTX>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NodeResult> + Send + 'a>> {
     Box::pin(async move {
         if ctx.current_ct.is_cancelled() {
@@ -180,7 +329,7 @@ fn eval<'a>(
             // ------------------------------------------------------------------
             BehaviorTreeNode::Condition { name, condition, true_branch, false_branch, .. } => {
                 trace!("Condition {}", name);
-                if condition.evaluate(&ctx.blackboard).await {
+                if condition.evaluate(&ctx).await {
                     eval(true_branch, handles, ctx).await
                 } else if let Some(fb) = false_branch {
                     eval(fb, handles, ctx).await
@@ -196,11 +345,11 @@ fn eval<'a>(
 // eval_action — poll_once → spawn if Pending
 // ---------------------------------------------------------------------------
 
-async fn eval_action(
+async fn eval_action<CTX: Send + Sync + 'static>(
     id: NodeId,
-    action: Arc<dyn AsyncBehaviorNode>,
+    action: Arc<dyn AsyncBehaviorNode<CTX>>,
     handles: &mut HashMap<NodeId, JoinHandle<ActionResult>>,
-    ctx: AsyncExecutionContext,
+    ctx: AsyncExecutionContext<CTX>,
 ) -> NodeResult {
     // Check for an existing in-flight handle.
     if let Some(handle) = handles.get(&id) {
@@ -217,12 +366,7 @@ async fn eval_action(
     }
 
     // No existing handle — probe once with a noop waker.
-    // async_trait returns Pin<Box<dyn Future + Send + 'static>> so we can
-    // probe it once and, if Pending, spawn the SAME future — execute() is
-    // called exactly once regardless of outcome.
     let name = action.name().to_string();
-    // Box the future with an explicit move of `action` so it is 'static.
-    // poll_once probes it; if Pending we spawn the same boxed future.
     let spawn_ctx = ctx.child_context();
     let mut fut: std::pin::Pin<Box<dyn std::future::Future<Output = ActionResult> + Send + 'static>> =
         Box::pin(async move { action.execute(spawn_ctx).await });
@@ -286,8 +430,8 @@ fn apply_parallel_policy(
 // cancel_subtree_handles
 // ---------------------------------------------------------------------------
 
-fn cancel_subtree_handles(
-    node: &BehaviorTreeNode,
+fn cancel_subtree_handles<CTX: Send + Sync + 'static>(
+    node: &BehaviorTreeNode<CTX>,
     handles: &mut HashMap<NodeId, JoinHandle<ActionResult>>,
 ) {
     if let Some(h) = handles.remove(node.id()) {
@@ -305,7 +449,7 @@ fn cancel_subtree_handles(
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — CTX = ()
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -320,15 +464,15 @@ mod tests {
 
     // --- helpers ---
 
-    fn action_node(node: impl AsyncBehaviorNode + 'static) -> BehaviorTreeNode {
+    fn action_node(node: impl AsyncBehaviorNode<()> + 'static) -> BehaviorTreeNode<()> {
         BehaviorTreeNode::Action {
             id: NodeId::root("placeholder"), // overwritten by BehaviorTreeRuntime::new
             node: Arc::new(node),
         }
     }
 
-    fn rt(root: BehaviorTreeNode) -> BehaviorTreeRuntime {
-        BehaviorTreeRuntime::new(root, Blackboard::new())
+    fn rt(root: BehaviorTreeNode<()>) -> BehaviorTreeRuntime<()> {
+        BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()))
     }
 
     // --- mock nodes ---
@@ -337,8 +481,8 @@ mod tests {
     struct AlwaysSuccess;
 
     #[async_trait]
-    impl AsyncBehaviorNode for AlwaysSuccess {
-        async fn execute(&self, _ctx: AsyncExecutionContext) -> ActionResult {
+    impl AsyncBehaviorNode<()> for AlwaysSuccess {
+        async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             ActionResult::Success
         }
         fn name(&self) -> &str { "AlwaysSuccess" }
@@ -348,8 +492,8 @@ mod tests {
     struct AlwaysFailure;
 
     #[async_trait]
-    impl AsyncBehaviorNode for AlwaysFailure {
-        async fn execute(&self, _ctx: AsyncExecutionContext) -> ActionResult {
+    impl AsyncBehaviorNode<()> for AlwaysFailure {
+        async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             ActionResult::Failure
         }
         fn name(&self) -> &str { "AlwaysFailure" }
@@ -360,8 +504,8 @@ mod tests {
     struct DelayedSuccess;
 
     #[async_trait]
-    impl AsyncBehaviorNode for DelayedSuccess {
-        async fn execute(&self, _ctx: AsyncExecutionContext) -> ActionResult {
+    impl AsyncBehaviorNode<()> for DelayedSuccess {
+        async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             ActionResult::Success
         }
@@ -372,8 +516,8 @@ mod tests {
     struct DelayedFailure;
 
     #[async_trait]
-    impl AsyncBehaviorNode for DelayedFailure {
-        async fn execute(&self, _ctx: AsyncExecutionContext) -> ActionResult {
+    impl AsyncBehaviorNode<()> for DelayedFailure {
+        async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             ActionResult::Failure
         }
@@ -385,8 +529,8 @@ mod tests {
     struct CountedSuccess(Arc<std::sync::atomic::AtomicUsize>);
 
     #[async_trait]
-    impl AsyncBehaviorNode for CountedSuccess {
-        async fn execute(&self, _ctx: AsyncExecutionContext) -> ActionResult {
+    impl AsyncBehaviorNode<()> for CountedSuccess {
+        async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             ActionResult::Success
         }
@@ -397,14 +541,11 @@ mod tests {
 
     #[tokio::test]
     async fn sync_action_completes_in_one_tick() {
-        // AlwaysSuccess has no .await — poll_once should catch it immediately.
         let mut rt = rt(action_node(AlwaysSuccess));
         assert_eq!(rt.tick().await, NodeResult::Success);
-        // No handles should remain.
         assert!(rt.handles.is_empty());
     }
 
-    /// Sync action: poll_once catches it — execute() called exactly once, no spawn.
     #[tokio::test]
     async fn sync_action_execute_called_exactly_once() {
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -414,7 +555,7 @@ mod tests {
 
         assert_eq!(result, NodeResult::Success);
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(rt.handles.is_empty()); // never spawned
+        assert!(rt.handles.is_empty());
     }
 
     #[tokio::test]
@@ -426,14 +567,12 @@ mod tests {
 
     #[tokio::test]
     async fn async_action_running_then_success() {
-        // DelayedSuccess hits .await → spawned → Running on tick 1.
         let mut rt = rt(action_node(DelayedSuccess));
 
         let r1 = rt.tick().await;
         assert_eq!(r1, NodeResult::Running);
         assert_eq!(rt.handles.len(), 1);
 
-        // Wait for the action to finish.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let r2 = rt.tick().await;
@@ -448,7 +587,7 @@ mod tests {
             name: "seq".into(),
             children: vec![action_node(AlwaysSuccess), action_node(AlwaysSuccess)],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
         assert_eq!(rt.tick().await, NodeResult::Success);
     }
 
@@ -459,7 +598,7 @@ mod tests {
             name: "seq".into(),
             children: vec![action_node(AlwaysFailure), action_node(AlwaysSuccess)],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
         assert_eq!(rt.tick().await, NodeResult::Failure);
     }
 
@@ -470,7 +609,7 @@ mod tests {
             name: "sel".into(),
             children: vec![action_node(AlwaysSuccess), action_node(AlwaysFailure)],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
         assert_eq!(rt.tick().await, NodeResult::Success);
     }
 
@@ -481,7 +620,7 @@ mod tests {
             name: "sel".into(),
             children: vec![action_node(AlwaysFailure), action_node(AlwaysSuccess)],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
         assert_eq!(rt.tick().await, NodeResult::Success);
     }
 
@@ -492,63 +631,52 @@ mod tests {
             name: "sel".into(),
             children: vec![action_node(AlwaysFailure), action_node(AlwaysFailure)],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
         assert_eq!(rt.tick().await, NodeResult::Failure);
     }
 
-    /// Selector: child[0] is long-running → selector returns Running, child[1] never touched.
-    /// When child[0] eventually succeeds → selector returns Success.
     #[tokio::test]
     async fn selector_waits_for_running_child_then_succeeds() {
         let root = BehaviorTreeNode::Selector {
             id: NodeId::root("sel"),
             name: "sel".into(),
             children: vec![
-                action_node(DelayedSuccess), // child[0]: long-running
-                action_node(AlwaysSuccess),  // child[1]: never reached while child[0] runs
+                action_node(DelayedSuccess),
+                action_node(AlwaysSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
-        // Tick 1: child[0] spawned → Running. child[1] not evaluated.
         assert_eq!(rt.tick().await, NodeResult::Running);
-        assert_eq!(rt.handles.len(), 1); // only child[0] in-flight
+        assert_eq!(rt.handles.len(), 1);
 
-        // Wait for child[0] to finish.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Tick 2: child[0] done with Success → selector returns Success immediately.
         assert_eq!(rt.tick().await, NodeResult::Success);
         assert!(rt.handles.is_empty());
     }
 
-    /// Selector: child[0] is long-running but eventually fails →
-    /// selector falls through to child[1] which succeeds.
     #[tokio::test]
     async fn selector_long_running_failure_falls_through() {
         let root = BehaviorTreeNode::Selector {
             id: NodeId::root("sel"),
             name: "sel".into(),
             children: vec![
-                action_node(DelayedFailure), // child[0]: long-running, fails
-                action_node(AlwaysSuccess),  // child[1]: fallback
+                action_node(DelayedFailure),
+                action_node(AlwaysSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
-        // Tick 1: child[0] spawned → Running.
         assert_eq!(rt.tick().await, NodeResult::Running);
         assert_eq!(rt.handles.len(), 1);
 
-        // Wait for child[0] to finish.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Tick 2: child[0] done with Failure → try child[1] → Success.
         assert_eq!(rt.tick().await, NodeResult::Success);
         assert!(rt.handles.is_empty());
     }
 
-    /// Parallel AllSucceed: one short, one long — Running until both done.
     #[tokio::test]
     async fn parallel_all_succeed_waits_for_slow_child() {
         let root = BehaviorTreeNode::Parallel {
@@ -556,24 +684,21 @@ mod tests {
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AllSucceed,
             children: vec![
-                action_node(AlwaysSuccess),  // child[0]: instant
-                action_node(DelayedSuccess), // child[1]: slow
+                action_node(AlwaysSuccess),
+                action_node(DelayedSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
-        // Tick 1: child[0] succeeds immediately, child[1] spawned → Running.
         assert_eq!(rt.tick().await, NodeResult::Running);
-        assert_eq!(rt.handles.len(), 1); // only child[1] in-flight
+        assert_eq!(rt.handles.len(), 1);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Tick 2: child[0] re-evals as instant success, child[1] done → AllSucceed.
         assert_eq!(rt.tick().await, NodeResult::Success);
         assert!(rt.handles.is_empty());
     }
 
-    /// Parallel AllSucceed: any failure → overall Failure immediately.
     #[tokio::test]
     async fn parallel_all_succeed_fails_on_any_failure() {
         let root = BehaviorTreeNode::Parallel {
@@ -581,17 +706,15 @@ mod tests {
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AllSucceed,
             children: vec![
-                action_node(AlwaysFailure),  // child[0]: instant fail
-                action_node(DelayedSuccess), // child[1]: slow, shouldn't matter
+                action_node(AlwaysFailure),
+                action_node(DelayedSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
-        // child[0] fails immediately → AllSucceed returns Failure.
         assert_eq!(rt.tick().await, NodeResult::Failure);
     }
 
-    /// Parallel FirstSucceed: first to succeed wins, even if others are running.
     #[tokio::test]
     async fn parallel_first_succeed_short_wins() {
         let root = BehaviorTreeNode::Parallel {
@@ -599,17 +722,15 @@ mod tests {
             name: "par".into(),
             policy: crate::types::ParallelPolicy::FirstSucceed,
             children: vec![
-                action_node(DelayedSuccess), // child[0]: slow
-                action_node(AlwaysSuccess),  // child[1]: instant
+                action_node(DelayedSuccess),
+                action_node(AlwaysSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
-        // Tick 1: child[0] spawned, child[1] succeeds instantly → FirstSucceed wins.
         assert_eq!(rt.tick().await, NodeResult::Success);
     }
 
-    /// Parallel AnySucceed: waits for all, succeeds if at least one succeeded.
     #[tokio::test]
     async fn parallel_any_succeed_waits_for_all() {
         let root = BehaviorTreeNode::Parallel {
@@ -617,24 +738,20 @@ mod tests {
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AnySucceed,
             children: vec![
-                action_node(AlwaysSuccess),  // child[0]: instant success
-                action_node(DelayedFailure), // child[1]: slow failure
+                action_node(AlwaysSuccess),
+                action_node(DelayedFailure),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
-        // Tick 1: child[0] done, child[1] running → AnySucceed waits for all.
         assert_eq!(rt.tick().await, NodeResult::Running);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Tick 2: both done, one succeeded → AnySucceed returns Success.
         assert_eq!(rt.tick().await, NodeResult::Success);
         assert!(rt.handles.is_empty());
     }
 
-    /// Regression: when a parallel inside a selector fails (one child fails fast,
-    /// sibling still running), the sibling's handle must be cancelled — not leaked.
     #[tokio::test]
     async fn selector_cancels_leaked_handles_from_failed_parallel() {
         let root = BehaviorTreeNode::Selector {
@@ -646,24 +763,20 @@ mod tests {
                     name: "par".into(),
                     policy: crate::types::ParallelPolicy::AllSucceed,
                     children: vec![
-                        action_node(AlwaysFailure),  // fails immediately → parallel fails
-                        action_node(DelayedSuccess), // still running → should be cancelled
+                        action_node(AlwaysFailure),
+                        action_node(DelayedSuccess),
                     ],
                 },
-                action_node(AlwaysSuccess), // selector fallback
+                action_node(AlwaysSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
-        // Parallel fails → selector falls to child[1] → Success.
-        // DelayedSuccess handle must NOT leak.
         let result = rt.tick().await;
         assert_eq!(result, NodeResult::Success);
         assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
     }
 
-    /// Parallel AllSucceed: one child fails immediately — sibling's in-flight
-    /// handle must be cancelled, not leaked.
     #[tokio::test]
     async fn parallel_all_succeed_cancels_sibling_on_failure() {
         let root = BehaviorTreeNode::Parallel {
@@ -671,18 +784,16 @@ mod tests {
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AllSucceed,
             children: vec![
-                action_node(AlwaysFailure),  // fails immediately → AllSucceed fails
-                action_node(DelayedSuccess), // still running → must be cancelled
+                action_node(AlwaysFailure),
+                action_node(DelayedSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
         assert_eq!(rt.tick().await, NodeResult::Failure);
         assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
     }
 
-    /// Parallel FirstSucceed: one child succeeds immediately — sibling's in-flight
-    /// handle must be cancelled, not leaked.
     #[tokio::test]
     async fn parallel_first_succeed_cancels_sibling_on_success() {
         let root = BehaviorTreeNode::Parallel {
@@ -690,17 +801,16 @@ mod tests {
             name: "par".into(),
             policy: crate::types::ParallelPolicy::FirstSucceed,
             children: vec![
-                action_node(DelayedSuccess), // slow → spawned
-                action_node(AlwaysSuccess),  // succeeds immediately → FirstSucceed wins
+                action_node(DelayedSuccess),
+                action_node(AlwaysSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
         assert_eq!(rt.tick().await, NodeResult::Success);
         assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
     }
 
-    /// rt.cancel() must abort all in-flight handles.
     #[tokio::test]
     async fn cancel_clears_all_handles() {
         let root = BehaviorTreeNode::Parallel {
@@ -713,7 +823,7 @@ mod tests {
                 action_node(DelayedSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
         assert_eq!(rt.tick().await, NodeResult::Running);
         assert_eq!(rt.handles.len(), 3);
@@ -722,9 +832,34 @@ mod tests {
         assert!(rt.handles.is_empty(), "leaked handles after cancel: {}", rt.handles.len());
     }
 
-    /// Deeply nested: selector → parallel(AllSucceed) → parallel(AllSucceed)
-    /// Inner parallel fails fast, outer parallel fails, selector falls through.
-    /// No handles should leak at any level.
+    #[tokio::test]
+    async fn interrupt_resets_for_next_tick() {
+        let root = BehaviorTreeNode::Parallel {
+            id: NodeId::root("par"),
+            name: "par".into(),
+            policy: crate::types::ParallelPolicy::AllSucceed,
+            children: vec![
+                action_node(DelayedSuccess),
+                action_node(DelayedSuccess),
+            ],
+        };
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
+
+        // First tick — two async actions spawned.
+        assert_eq!(rt.tick().await, NodeResult::Running);
+        assert_eq!(rt.handles.len(), 2);
+
+        // Interrupt — aborts all handles, resets cancellation token.
+        rt.interrupt();
+        assert!(rt.handles.is_empty());
+
+        // Next tick must run cleanly from root (not return Failure due to cancelled token).
+        // The actions are new invocations so they go through the spawn path again.
+        let r = rt.tick().await;
+        assert!(r == NodeResult::Running, "expected Running after interrupt, got {:?}", r);
+        assert_eq!(rt.handles.len(), 2);
+    }
+
     #[tokio::test]
     async fn deeply_nested_failure_no_leaked_handles() {
         let root = BehaviorTreeNode::Selector {
@@ -741,24 +876,22 @@ mod tests {
                             name: "inner_par".into(),
                             policy: crate::types::ParallelPolicy::AllSucceed,
                             children: vec![
-                                action_node(AlwaysFailure),  // fails → inner fails
-                                action_node(DelayedSuccess), // sibling → must cancel
+                                action_node(AlwaysFailure),
+                                action_node(DelayedSuccess),
                             ],
                         },
-                        action_node(DelayedSuccess), // outer sibling → must cancel
+                        action_node(DelayedSuccess),
                     ],
                 },
-                action_node(AlwaysSuccess), // fallback
+                action_node(AlwaysSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
         assert_eq!(rt.tick().await, NodeResult::Success);
         assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
     }
 
-    /// Sequence: middle child is a parallel that eventually fails.
-    /// No handles should accumulate across ticks.
     #[tokio::test]
     async fn sequence_parallel_failure_no_leaked_handles() {
         let root = BehaviorTreeNode::Sequence {
@@ -771,28 +904,24 @@ mod tests {
                     name: "par".into(),
                     policy: crate::types::ParallelPolicy::AllSucceed,
                     children: vec![
-                        action_node(DelayedFailure), // slow fail
-                        action_node(DelayedSuccess), // slow success
+                        action_node(DelayedFailure),
+                        action_node(DelayedSuccess),
                     ],
                 },
                 action_node(AlwaysSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
-        // Tick 1: parallel running (2 handles)
         assert_eq!(rt.tick().await, NodeResult::Running);
         assert_eq!(rt.handles.len(), 2);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Tick 2: DelayedFailure done → AllSucceed fails → cancel DelayedSuccess
-        // Sequence fails → no handles remain
         assert_eq!(rt.tick().await, NodeResult::Failure);
         assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
     }
 
-    /// Re-ticking a running node does not spawn duplicate handles.
     #[tokio::test]
     async fn no_duplicate_handles_across_ticks() {
         let root = BehaviorTreeNode::Parallel {
@@ -804,9 +933,8 @@ mod tests {
                 action_node(DelayedSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
-        // Multiple ticks while running — handle count must stay at 2, not grow
         for _ in 0..5 {
             assert_eq!(rt.tick().await, NodeResult::Running);
             assert_eq!(rt.handles.len(), 2, "handles grew unexpectedly");
@@ -817,7 +945,6 @@ mod tests {
         assert!(rt.handles.is_empty());
     }
 
-    /// Action that watches a blackboard key and completes when it changes.
     #[cfg(feature = "watch")]
     #[derive(Debug)]
     struct WatchAction {
@@ -826,9 +953,9 @@ mod tests {
 
     #[cfg(feature = "watch")]
     #[async_trait]
-    impl AsyncBehaviorNode for WatchAction {
+    impl AsyncBehaviorNode<()> for WatchAction {
         fn name(&self) -> &str { "WatchAction" }
-        async fn execute(&self, ctx: AsyncExecutionContext) -> ActionResult {
+        async fn execute(&self, ctx: AsyncExecutionContext<()>) -> ActionResult {
             let mut rx = ctx.blackboard.watch(self.key).await;
             rx.changed().await.unwrap();
             ActionResult::Success
@@ -845,37 +972,33 @@ mod tests {
         let mut rt = BehaviorTreeRuntime::new(
             action_node(WatchAction { key: SIGNAL::KEY }),
             bb.clone(),
+            Arc::new(()),
         );
 
-        // Tick 1: action spawned, waiting on watch → Running.
         assert_eq!(rt.tick().await, NodeResult::Running);
         assert_eq!(rt.handles.len(), 1);
 
-        // Write to the key — this fires the watch channel and wakes the action.
         bb.insert_key::<SIGNAL>(1).await;
 
-        // Give the spawned task a moment to process the wakeup.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Tick 2: action completed → Success.
         assert_eq!(rt.tick().await, NodeResult::Success);
         assert!(rt.handles.is_empty());
     }
 
-    /// Selector: child[0] succeeds immediately — child[1] (long-running) never starts.
     #[tokio::test]
     async fn selector_short_success_skips_long_child() {
         let root = BehaviorTreeNode::Selector {
             id: NodeId::root("sel"),
             name: "sel".into(),
             children: vec![
-                action_node(AlwaysSuccess),  // child[0]: instant success
-                action_node(DelayedSuccess), // child[1]: never touched
+                action_node(AlwaysSuccess),
+                action_node(DelayedSuccess),
             ],
         };
-        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new());
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
         assert_eq!(rt.tick().await, NodeResult::Success);
-        assert!(rt.handles.is_empty()); // child[1] was never spawned
+        assert!(rt.handles.is_empty());
     }
 }

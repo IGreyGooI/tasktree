@@ -1,9 +1,8 @@
 //! Core data structures for async behavior tree
 
-use std::fmt::Debug;
+use std::sync::Arc;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
 use crate::blackboard::Blackboard;
 
 /// Result returned by action leaf nodes — no Running, that is the runtime's job
@@ -33,56 +32,78 @@ impl From<ActionResult> for NodeResult {
     }
 }
 
-/// Execution context passed to async behavior nodes
-#[derive(Debug, Clone)]
-pub struct AsyncExecutionContext {
-    /// Shared blackboard for state management
+/// Execution context passed to async behavior nodes and conditions on every tick.
+///
+/// `CTX` is the engine-specific user context (e.g. `EngineContext { world, npc_id }`).
+/// The tasktree library itself is agnostic to what `CTX` contains.  Use `CTX = ()`
+/// for trees that do not need a user context.
+///
+/// # Fields
+///
+/// * [`blackboard`](Self::blackboard) — shared key/value store for cross-node communication
+/// * [`current_ct`](Self::current_ct) — cooperative cancellation signal; thread it into
+///   every long `.await` your action does so cancellation reaches in-flight work
+/// * [`user`](Self::user) — engine context, cloned cheaply via `Arc`
+///
+/// # Example
+///
+/// ```rust,ignore
+/// async fn execute(&self, ctx: AsyncExecutionContext<MyCtx>) -> ActionResult {
+///     // Read shared state from the user context.
+///     let world = ctx.user.world.clone();
+///
+///     // Long async work — pass the cancellation token down.
+///     let result = call_llm(&world, &ctx.current_ct).await;
+///
+///     match result {
+///         Ok(v) => { /* apply, emit events */ ActionResult::Success }
+///         Err(_) => ActionResult::Failure,
+///     }
+/// }
+/// ```
+#[derive(Clone)]
+pub struct AsyncExecutionContext<CTX> {
+    /// Shared blackboard for state management.
     pub blackboard: Blackboard,
-    /// Current cancellation token for this execution scope
+    /// Cooperative cancellation token for this execution scope.
+    /// Pass this into every long `.await` an action makes.
     pub current_ct: CancellationToken,
+    /// Engine-injected context (world handle, npc id, …).
+    /// Cloned cheaply via `Arc` on every child context.
+    pub user: Arc<CTX>,
 }
 
-impl AsyncExecutionContext {
-    /// Create a new execution context
-    pub fn new(blackboard: Blackboard, cancellation_token: CancellationToken) -> Self {
+impl<CTX: std::fmt::Debug> std::fmt::Debug for AsyncExecutionContext<CTX> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncExecutionContext")
+            .field("blackboard", &self.blackboard)
+            .field("current_ct", &self.current_ct)
+            .field("user", &self.user)
+            .finish()
+    }
+}
+
+impl<CTX: Send + Sync + 'static> AsyncExecutionContext<CTX> {
+    /// Create a new execution context.
+    pub fn new(
+        blackboard: Blackboard,
+        cancellation_token: CancellationToken,
+        user: Arc<CTX>,
+    ) -> Self {
         Self {
             blackboard,
             current_ct: cancellation_token,
+            user,
         }
     }
 
-    /// Execute a child node with this context (stack-based execution)
-    #[track_caller]
-    pub fn execute<'a>(&'a self, node: &'a crate::tree::BehaviorTreeNode) -> std::pin::Pin<Box<dyn std::future::Future<Output = NodeResult> + Send + 'a>> {
-        // Create child context with hierarchical cancellation
-        let child_context = self.child_context();
-        debug!("Executing node: {}", node.name());
-        Box::pin(async move {
-            match node {
-                crate::tree::BehaviorTreeNode::Action { node, .. } => {
-                    node.execute(child_context).await.into()
-                }
-                crate::tree::BehaviorTreeNode::Sequence { name, children, .. } => {
-                    crate::nodes::sequence::execute_sequence(name, children, child_context).await
-                }
-                crate::tree::BehaviorTreeNode::Selector { name, children, .. } => {
-                    crate::nodes::selector::execute_selector(name, children, child_context).await
-                }
-                crate::tree::BehaviorTreeNode::Parallel { name, children, policy, .. } => {
-                    crate::nodes::parallel::execute_parallel(name, children, *policy, child_context).await
-                }
-                crate::tree::BehaviorTreeNode::Condition { name, condition, true_branch, false_branch, .. } => {
-                    crate::nodes::condition::execute_condition(name, condition, true_branch, false_branch, child_context).await
-                }
-            }
-        })
-    }
-
-    /// Create a child context that inherits parent cancellation
+    /// Create a child context that inherits parent cancellation.
+    /// `Arc::clone` on `user` is cheap.
     pub fn child_context(&self) -> Self {
         Self {
             blackboard: self.blackboard.clone(),
             current_ct: self.current_ct.child_token(),
+            user: Arc::clone(&self.user),
         }
     }
 }

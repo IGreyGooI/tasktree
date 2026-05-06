@@ -11,10 +11,11 @@ keywords = ["behavior-tree", "async", "robotics", "ai", "game"]
 categories = ["asynchronous", "game-engines"]
 
 [features]
-default = ["serde", "watch"]
-serde   = ["dep:typetag", "dep:serde", "dep:serde_json", "dep:serde_norway"]
+default = ["serde", "watch", "xml"]
+serde   = ["dep:serde", "dep:serde_json", "dep:serde_norway"]
 watch   = ["tokio/sync"]
 lua     = ["dep:mlua", "serde"]
+xml     = ["dep:quick-xml"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
@@ -22,14 +23,15 @@ tokio-util = { version = "0.7" }
 async-trait = "0.1"
 tracing = "0.1"
 thiserror = "2.0"
-scc = "3.1"
-inventory = "0.3"
+scc = "3.7.0"
 
 # serde feature deps
-typetag = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive", "rc"], optional = true }
 serde_json = { version = "1", optional = true }
 serde_norway = { version = "0.9", optional = true }
+
+# xml feature deps
+quick-xml = { version = "0.39", optional = true }
 
 # lua feature deps
 mlua = { version = "0.11", features = ["lua55", "vendored", "async", "send", "serde"], optional = true }

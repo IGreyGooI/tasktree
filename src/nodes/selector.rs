@@ -5,29 +5,26 @@ use crate::types::{AsyncExecutionContext, NodeResult};
 use tracing::{debug, trace};
 
 /// Execute selector node logic
-/// 
+///
 /// A selector tries each child in order until one succeeds.
-/// Returns Success if any child succeeds, Failure if all fail, Cancelled if interrupted.
-pub async fn execute_selector(
+/// Returns Success if any child succeeds, Failure if all fail.
+pub async fn execute_selector<CTX: Send + Sync + 'static>(
     name: &str,
-    children: &[BehaviorTreeNode],
-    ctx: AsyncExecutionContext,
+    children: &[BehaviorTreeNode<CTX>],
+    ctx: AsyncExecutionContext<CTX>,
 ) -> NodeResult {
     trace!("Executing selector: {}", name);
-    
-    // Try each child until one succeeds
+
     for (i, child) in children.iter().enumerate() {
-        // Check cancellation before each child
         if ctx.current_ct.is_cancelled() {
             debug!("Selector {} cancelled at child {}", name, i);
-            return NodeResult::Failure; // Return failure when cancelled
+            return NodeResult::Failure;
         }
-        
+
         trace!("Selector {} trying child {} ({})", name, i, child.name());
-        
-        // Execute child with context
-        let result = ctx.execute(child).await;
-        
+
+        let result = child.execute(ctx.child_context()).await;
+
         match result {
             NodeResult::Success => {
                 debug!("Selector {} succeeded with child {}", name, i);
@@ -43,7 +40,7 @@ pub async fn execute_selector(
             }
         }
     }
-    
+
     debug!("Selector {} failed - all children failed", name);
     NodeResult::Failure
 }

@@ -5,29 +5,26 @@ use crate::types::{AsyncExecutionContext, NodeResult};
 use tracing::{debug, trace};
 
 /// Execute sequence node logic
-/// 
+///
 /// A sequence executes each child in order until one fails.
-/// Returns Success if all children succeed, Failure if any fails, Cancelled if interrupted.
-pub async fn execute_sequence(
+/// Returns Success if all children succeed, Failure if any fails.
+pub async fn execute_sequence<CTX: Send + Sync + 'static>(
     name: &str,
-    children: &[BehaviorTreeNode],
-    ctx: AsyncExecutionContext,
+    children: &[BehaviorTreeNode<CTX>],
+    ctx: AsyncExecutionContext<CTX>,
 ) -> NodeResult {
     trace!("Executing sequence: {}", name);
-    
-    // Execute each child until one fails
+
     for (i, child) in children.iter().enumerate() {
-        // Check cancellation before each child
         if ctx.current_ct.is_cancelled() {
             debug!("Sequence {} cancelled at child {}", name, i);
-            return NodeResult::Failure; // Return failure when cancelled
+            return NodeResult::Failure;
         }
-        
+
         trace!("Sequence {} executing child {} ({})", name, i, child.name());
-        
-        // Execute child with context
-        let result = ctx.execute(child).await;
-        
+
+        let result = child.execute(ctx.child_context()).await;
+
         match result {
             NodeResult::Success => {
                 trace!("Sequence {} child {} succeeded, continuing", name, i);
@@ -43,7 +40,7 @@ pub async fn execute_sequence(
             }
         }
     }
-    
+
     debug!("Sequence {} succeeded - all children succeeded", name);
     NodeResult::Success
 }

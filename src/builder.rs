@@ -1,4 +1,4 @@
-//! Behavior Tree Builder - Fluent API for constructing behavior trees
+//! Behavior Tree Builder — fluent API for constructing behavior trees
 
 use crate::{
     condition::Condition,
@@ -9,27 +9,26 @@ use crate::{
 use std::{any::type_name_of_val, future::Future};
 use std::sync::Arc;
 
-/// Trait for converting items into AsyncBehaviorNode
-pub trait IntoAsyncBehaviorNode {
-    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode>;
-}
-
-/// Wrapper for functions that implement AsyncBehaviorNode
-pub struct FunctionNode<F> {
+/// Wrapper for plain async functions used as action nodes.
+///
+/// `CTX` must be `Send + Sync + 'static`.
+pub struct FunctionNode<CTX, F> {
     name: String,
     func: F,
+    _ctx: std::marker::PhantomData<CTX>,
 }
 
-impl<F> FunctionNode<F> {
+impl<CTX, F> FunctionNode<CTX, F> {
     pub fn new<S: Into<String>>(name: S, func: F) -> Self {
         Self {
             name: name.into(),
             func,
+            _ctx: std::marker::PhantomData,
         }
     }
 }
 
-impl<F> std::fmt::Debug for FunctionNode<F> {
+impl<CTX, F> std::fmt::Debug for FunctionNode<CTX, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FunctionNode")
             .field("name", &self.name)
@@ -39,12 +38,13 @@ impl<F> std::fmt::Debug for FunctionNode<F> {
 }
 
 #[async_trait::async_trait]
-impl<F, Fut> AsyncBehaviorNode for FunctionNode<F>
+impl<CTX, F, Fut> AsyncBehaviorNode<CTX> for FunctionNode<CTX, F>
 where
-    F: Fn(AsyncExecutionContext) -> Fut + Send + Sync + 'static,
+    CTX: Send + Sync + 'static,
+    F: Fn(AsyncExecutionContext<CTX>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ActionResult> + Send + 'static,
 {
-    async fn execute(&self, ctx: AsyncExecutionContext) -> ActionResult {
+    async fn execute(&self, ctx: AsyncExecutionContext<CTX>) -> ActionResult {
         (self.func)(ctx).await
     }
 
@@ -53,43 +53,55 @@ where
     }
 }
 
-// Implement IntoAsyncBehaviorNode for Arc<dyn AsyncBehaviorNode>
-impl IntoAsyncBehaviorNode for Arc<dyn AsyncBehaviorNode> {
-    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode> {
+// ---------------------------------------------------------------------------
+// IntoAsyncBehaviorNode — conversion trait
+// ---------------------------------------------------------------------------
+
+/// Trait for converting items into `Arc<dyn AsyncBehaviorNode<CTX>>`.
+pub trait IntoAsyncBehaviorNode<CTX: Send + Sync + 'static> {
+    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode<CTX>>;
+}
+
+/// `Arc<dyn AsyncBehaviorNode<CTX>>` → identity
+impl<CTX: Send + Sync + 'static> IntoAsyncBehaviorNode<CTX> for Arc<dyn AsyncBehaviorNode<CTX>> {
+    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode<CTX>> {
         self
     }
 }
 
-// Implement for any type that already implements AsyncBehaviorNode (via Arc)
-impl<T> IntoAsyncBehaviorNode for Arc<T>
+/// `Arc<T>` where `T: AsyncBehaviorNode<CTX>` → upcasted
+impl<CTX, T> IntoAsyncBehaviorNode<CTX> for Arc<T>
 where
-    T: AsyncBehaviorNode + 'static,
+    CTX: Send + Sync + 'static,
+    T: AsyncBehaviorNode<CTX> + 'static,
 {
-    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode> {
+    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode<CTX>> {
         self
     }
 }
 
-// Implement for functions with automatic name derivation
-impl<F, Fut> IntoAsyncBehaviorNode for F
+/// Bare async function `fn(AsyncExecutionContext<CTX>) -> impl Future` — auto-named
+impl<CTX, F, Fut> IntoAsyncBehaviorNode<CTX> for F
 where
-    F: Fn(AsyncExecutionContext) -> Fut + Send + Sync + 'static,
+    CTX: Send + Sync + 'static,
+    F: Fn(AsyncExecutionContext<CTX>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ActionResult> + Send + 'static,
 {
-    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode> {
+    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode<CTX>> {
         let type_name = std::any::type_name::<F>();
         let name = extract_function_name(type_name);
         Arc::new(FunctionNode::new(name, self))
     }
 }
 
-// Keep the tuple version for explicit naming
-impl<F, Fut> IntoAsyncBehaviorNode for (&'static str, F)
+/// `(&'static str, F)` tuple — explicit name
+impl<CTX, F, Fut> IntoAsyncBehaviorNode<CTX> for (&'static str, F)
 where
-    F: Fn(AsyncExecutionContext) -> Fut + Send + Sync + 'static,
+    CTX: Send + Sync + 'static,
+    F: Fn(AsyncExecutionContext<CTX>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ActionResult> + Send + 'static,
 {
-    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode> {
+    fn into_async_behavior_node(self) -> Arc<dyn AsyncBehaviorNode<CTX>> {
         let (name, func) = self;
         Arc::new(FunctionNode::new(name, func))
     }
@@ -114,41 +126,45 @@ fn extract_function_name(type_name: &str) -> String {
     }
 }
 
-fn make_action(node: impl IntoAsyncBehaviorNode) -> BehaviorTreeNode {
+fn make_action<CTX: Send + Sync + 'static>(node: impl IntoAsyncBehaviorNode<CTX>) -> BehaviorTreeNode<CTX> {
     BehaviorTreeNode::Action {
         id: NodeId::default(),
         node: node.into_async_behavior_node(),
     }
 }
 
-/// Builder for constructing behavior trees with a fluent API
+// ---------------------------------------------------------------------------
+// Builders
+// ---------------------------------------------------------------------------
+
+/// Entry point for the fluent builder API.
 pub struct BehaviorTreeBuilder;
 
 /// Builder for Sequence nodes
-pub struct SequenceBuilder {
+pub struct SequenceBuilder<CTX> {
     name: String,
-    children: Vec<BehaviorTreeNode>,
+    children: Vec<BehaviorTreeNode<CTX>>,
 }
 
 /// Builder for Selector nodes
-pub struct SelectorBuilder {
+pub struct SelectorBuilder<CTX> {
     name: String,
-    children: Vec<BehaviorTreeNode>,
+    children: Vec<BehaviorTreeNode<CTX>>,
 }
 
 /// Builder for Parallel nodes
-pub struct ParallelBuilder {
+pub struct ParallelBuilder<CTX> {
     name: String,
-    children: Vec<BehaviorTreeNode>,
+    children: Vec<BehaviorTreeNode<CTX>>,
     policy: ParallelPolicy,
 }
 
 /// Builder for Condition nodes
-pub struct ConditionBuilder {
+pub struct ConditionBuilder<CTX> {
     name: String,
-    condition: Arc<dyn Condition>,
-    true_branch: Option<BehaviorTreeNode>,
-    false_branch: Option<BehaviorTreeNode>,
+    condition: Arc<dyn Condition<CTX>>,
+    true_branch: Option<BehaviorTreeNode<CTX>>,
+    false_branch: Option<BehaviorTreeNode<CTX>>,
 }
 
 impl BehaviorTreeBuilder {
@@ -156,19 +172,19 @@ impl BehaviorTreeBuilder {
         Self
     }
 
-    pub fn action(action: impl IntoAsyncBehaviorNode) -> BehaviorTreeNode {
+    pub fn action<CTX: Send + Sync + 'static>(action: impl IntoAsyncBehaviorNode<CTX>) -> BehaviorTreeNode<CTX> {
         make_action(action)
     }
 
-    pub fn sequence<S: Into<String>>(name: S) -> SequenceBuilder {
+    pub fn sequence<CTX: Send + Sync + 'static, S: Into<String>>(name: S) -> SequenceBuilder<CTX> {
         SequenceBuilder { name: name.into(), children: Vec::new() }
     }
 
-    pub fn selector<S: Into<String>>(name: S) -> SelectorBuilder {
+    pub fn selector<CTX: Send + Sync + 'static, S: Into<String>>(name: S) -> SelectorBuilder<CTX> {
         SelectorBuilder { name: name.into(), children: Vec::new() }
     }
 
-    pub fn parallel<S: Into<String>>(name: S) -> ParallelBuilder {
+    pub fn parallel<CTX: Send + Sync + 'static, S: Into<String>>(name: S) -> ParallelBuilder<CTX> {
         ParallelBuilder {
             name: name.into(),
             children: Vec::new(),
@@ -176,7 +192,10 @@ impl BehaviorTreeBuilder {
         }
     }
 
-    pub fn condition<S: Into<String>>(name: S, condition: Arc<dyn Condition>) -> ConditionBuilder {
+    pub fn condition<CTX: Send + Sync + 'static, S: Into<String>>(
+        name: S,
+        condition: Arc<dyn Condition<CTX>>,
+    ) -> ConditionBuilder<CTX> {
         ConditionBuilder {
             name: name.into(),
             condition,
@@ -192,23 +211,23 @@ impl Default for BehaviorTreeBuilder {
     }
 }
 
-impl SequenceBuilder {
-    pub fn child(mut self, child: BehaviorTreeNode) -> Self {
+impl<CTX: Send + Sync + 'static> SequenceBuilder<CTX> {
+    pub fn child(mut self, child: BehaviorTreeNode<CTX>) -> Self {
         self.children.push(child);
         self
     }
 
-    pub fn action(mut self, action: impl IntoAsyncBehaviorNode) -> Self {
+    pub fn action(mut self, action: impl IntoAsyncBehaviorNode<CTX>) -> Self {
         self.children.push(make_action(action));
         self
     }
 
-    pub fn children(mut self, children: impl IntoIterator<Item = BehaviorTreeNode>) -> Self {
+    pub fn children(mut self, children: impl IntoIterator<Item = BehaviorTreeNode<CTX>>) -> Self {
         self.children.extend(children);
         self
     }
 
-    pub fn build(self) -> BehaviorTreeNode {
+    pub fn build(self) -> BehaviorTreeNode<CTX> {
         BehaviorTreeNode::Sequence {
             id: NodeId::default(),
             name: self.name,
@@ -217,23 +236,23 @@ impl SequenceBuilder {
     }
 }
 
-impl SelectorBuilder {
-    pub fn child(mut self, child: BehaviorTreeNode) -> Self {
+impl<CTX: Send + Sync + 'static> SelectorBuilder<CTX> {
+    pub fn child(mut self, child: BehaviorTreeNode<CTX>) -> Self {
         self.children.push(child);
         self
     }
 
-    pub fn action(mut self, action: impl IntoAsyncBehaviorNode) -> Self {
+    pub fn action(mut self, action: impl IntoAsyncBehaviorNode<CTX>) -> Self {
         self.children.push(make_action(action));
         self
     }
 
-    pub fn children(mut self, children: impl IntoIterator<Item = BehaviorTreeNode>) -> Self {
+    pub fn children(mut self, children: impl IntoIterator<Item = BehaviorTreeNode<CTX>>) -> Self {
         self.children.extend(children);
         self
     }
 
-    pub fn build(self) -> BehaviorTreeNode {
+    pub fn build(self) -> BehaviorTreeNode<CTX> {
         BehaviorTreeNode::Selector {
             id: NodeId::default(),
             name: self.name,
@@ -242,7 +261,7 @@ impl SelectorBuilder {
     }
 }
 
-impl ParallelBuilder {
+impl<CTX: Send + Sync + 'static> ParallelBuilder<CTX> {
     pub fn policy(mut self, policy: ParallelPolicy) -> Self {
         self.policy = policy;
         self
@@ -263,22 +282,22 @@ impl ParallelBuilder {
         self
     }
 
-    pub fn child(mut self, child: BehaviorTreeNode) -> Self {
+    pub fn child(mut self, child: BehaviorTreeNode<CTX>) -> Self {
         self.children.push(child);
         self
     }
 
-    pub fn action(mut self, action: impl IntoAsyncBehaviorNode) -> Self {
+    pub fn action(mut self, action: impl IntoAsyncBehaviorNode<CTX>) -> Self {
         self.children.push(make_action(action));
         self
     }
 
-    pub fn children(mut self, children: impl IntoIterator<Item = BehaviorTreeNode>) -> Self {
+    pub fn children(mut self, children: impl IntoIterator<Item = BehaviorTreeNode<CTX>>) -> Self {
         self.children.extend(children);
         self
     }
 
-    pub fn build(self) -> BehaviorTreeNode {
+    pub fn build(self) -> BehaviorTreeNode<CTX> {
         BehaviorTreeNode::Parallel {
             id: NodeId::default(),
             name: self.name,
@@ -288,18 +307,18 @@ impl ParallelBuilder {
     }
 }
 
-impl ConditionBuilder {
-    pub fn when_true(mut self, branch: BehaviorTreeNode) -> Self {
+impl<CTX: Send + Sync + 'static> ConditionBuilder<CTX> {
+    pub fn when_true(mut self, branch: BehaviorTreeNode<CTX>) -> Self {
         self.true_branch = Some(branch);
         self
     }
 
-    pub fn when_false(mut self, branch: BehaviorTreeNode) -> Self {
+    pub fn when_false(mut self, branch: BehaviorTreeNode<CTX>) -> Self {
         self.false_branch = Some(branch);
         self
     }
 
-    pub fn build(self) -> BehaviorTreeNode {
+    pub fn build(self) -> BehaviorTreeNode<CTX> {
         let true_branch = self
             .true_branch
             .expect("Condition node requires at least a true branch");
@@ -313,10 +332,17 @@ impl ConditionBuilder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::blackboard::Blackboard;
+
+    // Use () as CTX in all tests.
 
     #[derive(Debug)]
     struct MockAction {
@@ -324,8 +350,8 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl AsyncBehaviorNode for MockAction {
-        async fn execute(&self, _ctx: AsyncExecutionContext) -> ActionResult {
+    impl AsyncBehaviorNode<()> for MockAction {
+        async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             ActionResult::Success
         }
         fn name(&self) -> &str { &self.name }
@@ -338,44 +364,44 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Condition for MockCondition {
-        async fn evaluate(&self, _blackboard: &Blackboard) -> bool { self.result }
+    impl Condition<()> for MockCondition {
+        async fn evaluate(&self, _ctx: &AsyncExecutionContext<()>) -> bool { self.result }
         fn name(&self) -> &str { &self.name }
     }
 
-    async fn test_move_action(_ctx: AsyncExecutionContext) -> ActionResult {
+    async fn test_move_action(_ctx: AsyncExecutionContext<()>) -> ActionResult {
         ActionResult::Success
     }
 
-    async fn test_scan_action(_ctx: AsyncExecutionContext) -> ActionResult {
+    async fn test_scan_action(_ctx: AsyncExecutionContext<()>) -> ActionResult {
         ActionResult::Failure
     }
 
     #[test]
     fn test_action_builder_with_struct() {
         let action = Arc::new(MockAction { name: "test_action".to_string() });
-        let node = BehaviorTreeBuilder::action(action);
+        let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::action(action);
         assert!(node.is_action());
         assert_eq!(node.name(), "test_action");
     }
 
     #[test]
     fn test_action_builder_with_function() {
-        let node = BehaviorTreeBuilder::action(test_move_action);
+        let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::action(test_move_action);
         assert!(node.is_action());
         assert_eq!(node.name(), "test_move_action");
     }
 
     #[test]
     fn test_action_builder_with_named_function() {
-        let node = BehaviorTreeBuilder::action(("custom_move", test_move_action));
+        let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::action(("custom_move", test_move_action));
         assert!(node.is_action());
         assert_eq!(node.name(), "custom_move");
     }
 
     #[test]
     fn test_sequence_builder_with_functions() {
-        let node = BehaviorTreeBuilder::sequence("test_sequence")
+        let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::sequence("test_sequence")
             .action(test_move_action)
             .action(("scan", test_scan_action))
             .build();
@@ -388,7 +414,7 @@ mod tests {
     #[test]
     fn test_selector_builder_mixed() {
         let action1 = Arc::new(MockAction { name: "struct_action".to_string() });
-        let node = BehaviorTreeBuilder::selector("test_selector")
+        let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::selector("test_selector")
             .action(action1)
             .action(test_move_action)
             .build();
@@ -400,7 +426,7 @@ mod tests {
 
     #[test]
     fn test_parallel_builder_with_functions() {
-        let node = BehaviorTreeBuilder::parallel("test_parallel")
+        let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::parallel("test_parallel")
             .first_succeed()
             .action(test_move_action)
             .action(test_scan_action)
@@ -415,7 +441,7 @@ mod tests {
             name: "test_condition".to_string(),
             result: true,
         });
-        let node = BehaviorTreeBuilder::condition("test_condition_node", condition)
+        let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::condition("test_condition_node", condition)
             .when_true(BehaviorTreeBuilder::action(test_move_action))
             .build();
         assert_eq!(node.name(), "test_condition_node");
@@ -439,7 +465,7 @@ mod tests {
             name: "battery_low".to_string(),
             result: false,
         });
-        let tree = BehaviorTreeBuilder::selector("root")
+        let tree: BehaviorTreeNode<()> = BehaviorTreeBuilder::selector("root")
             .child(
                 BehaviorTreeBuilder::condition("battery_check", condition)
                     .when_true(BehaviorTreeBuilder::action(("charge", test_move_action)))

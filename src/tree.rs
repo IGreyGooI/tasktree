@@ -1,10 +1,11 @@
 //! Behavior Tree Structure Definition
 
-use crate::types::ParallelPolicy;
+use crate::types::{AsyncExecutionContext, NodeResult, ParallelPolicy};
 use crate::{condition::Condition, node::AsyncBehaviorNode};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use std::{fmt::Debug, sync::Arc};
+use tracing::debug;
 
 /// Stable identifier for a node, stamped at tree construction time.
 /// Stores a human-readable path string plus its pre-computed hash.
@@ -57,37 +58,39 @@ impl Hash for NodeId {
     }
 }
 
-/// Behavior tree node definition
+/// Behavior tree node definition.
 ///
-/// This enum represents the structure of the behavior tree.
+/// `CTX` is the engine-specific user context type, threaded through via `AsyncExecutionContext<CTX>`.
+/// Use `CTX = ()` for trees that don't need engine-specific context.
+///
 /// The executor uses this to control traversal, not the nodes themselves.
 #[derive(Debug, Clone)]
-pub enum BehaviorTreeNode {
+pub enum BehaviorTreeNode<CTX> {
     /// Leaf action node - actual work is done here
     Action {
         id: NodeId,
-        node: Arc<dyn AsyncBehaviorNode>,
+        node: Arc<dyn AsyncBehaviorNode<CTX>>,
     },
 
     /// Sequence - execute children in order until one fails
     Sequence {
         id: NodeId,
         name: String,
-        children: Vec<BehaviorTreeNode>,
+        children: Vec<BehaviorTreeNode<CTX>>,
     },
 
     /// Selector - execute children until one succeeds
     Selector {
         id: NodeId,
         name: String,
-        children: Vec<BehaviorTreeNode>,
+        children: Vec<BehaviorTreeNode<CTX>>,
     },
 
     /// Parallel - execute children concurrently
     Parallel {
         id: NodeId,
         name: String,
-        children: Vec<BehaviorTreeNode>,
+        children: Vec<BehaviorTreeNode<CTX>>,
         policy: ParallelPolicy,
     },
 
@@ -95,13 +98,13 @@ pub enum BehaviorTreeNode {
     Condition {
         id: NodeId,
         name: String,
-        condition: Arc<dyn Condition>,
-        true_branch: Box<BehaviorTreeNode>,
-        false_branch: Option<Box<BehaviorTreeNode>>,
+        condition: Arc<dyn Condition<CTX>>,
+        true_branch: Box<BehaviorTreeNode<CTX>>,
+        false_branch: Option<Box<BehaviorTreeNode<CTX>>>,
     },
 }
 
-impl BehaviorTreeNode {
+impl<CTX: Send + Sync + 'static> BehaviorTreeNode<CTX> {
     /// Get this node's stable id
     pub fn id(&self) -> &NodeId {
         match self {
@@ -168,7 +171,7 @@ impl BehaviorTreeNode {
     }
 
     /// Get children nodes (if this is a composite node)
-    pub fn children(&self) -> Vec<&BehaviorTreeNode> {
+    pub fn children(&self) -> Vec<&BehaviorTreeNode<CTX>> {
         match self {
             BehaviorTreeNode::Action { .. } => vec![],
             BehaviorTreeNode::Sequence { children, .. } => children.iter().collect(),
@@ -182,5 +185,40 @@ impl BehaviorTreeNode {
                 result
             }
         }
+    }
+
+    /// Execute this node with the given context.
+    ///
+    /// This is the stack-based dispatcher used by composite node implementations
+    /// in `nodes/`. It does NOT use the `handles` JoinHandle pool from `BehaviorTreeRuntime` —
+    /// action nodes are awaited inline. For the spawn-based runtime path, use
+    /// `BehaviorTreeRuntime::tick()`.
+    pub fn execute<'a>(
+        &'a self,
+        ctx: AsyncExecutionContext<CTX>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NodeResult> + Send + 'a>>
+    where
+        CTX: 'a,
+    {
+        debug!("Executing node: {}", self.name());
+        Box::pin(async move {
+            match self {
+                BehaviorTreeNode::Action { node, .. } => {
+                    node.execute(ctx).await.into()
+                }
+                BehaviorTreeNode::Sequence { name, children, .. } => {
+                    crate::nodes::sequence::execute_sequence(name, children, ctx).await
+                }
+                BehaviorTreeNode::Selector { name, children, .. } => {
+                    crate::nodes::selector::execute_selector(name, children, ctx).await
+                }
+                BehaviorTreeNode::Parallel { name, children, policy, .. } => {
+                    crate::nodes::parallel::execute_parallel(name, children, *policy, ctx).await
+                }
+                BehaviorTreeNode::Condition { name, condition, true_branch, false_branch, .. } => {
+                    crate::nodes::condition::execute_condition(name, condition, true_branch, false_branch, ctx).await
+                }
+            }
+        })
     }
 }
