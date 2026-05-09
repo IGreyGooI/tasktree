@@ -1,8 +1,8 @@
 //! Condition node execution logic
 
+use crate::condition::Condition;
 use crate::tree::BehaviorTreeNode;
 use crate::types::{AsyncExecutionContext, NodeResult};
-use crate::condition::Condition;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
@@ -35,7 +35,11 @@ pub async fn execute_condition<CTX: Send + Sync + 'static>(
 
     match branch_to_execute {
         Some(branch) => {
-            debug!("Condition {} executing {} branch", name, if condition_result { "true" } else { "false" });
+            debug!(
+                "Condition {} executing {} branch",
+                name,
+                if condition_result { "true" } else { "false" }
+            );
 
             if ctx.current_ct.is_cancelled() {
                 debug!("Condition {} cancelled before branch execution", name);
@@ -50,10 +54,12 @@ pub async fn execute_condition<CTX: Send + Sync + 'static>(
             } else {
                 NodeResult::Failure
             };
-            debug!("Condition {} has no {} branch, returning {:?}",
-                   name,
-                   if condition_result { "true" } else { "false" },
-                   result);
+            debug!(
+                "Condition {} has no {} branch, returning {:?}",
+                name,
+                if condition_result { "true" } else { "false" },
+                result
+            );
             result
         }
     }

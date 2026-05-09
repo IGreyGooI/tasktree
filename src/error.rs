@@ -87,10 +87,11 @@ impl SourcePos {
     /// derived by counting `\n` bytes in the prefix (O(offset), negligible for
     /// config files).
     pub fn from_reader(reader: &quick_xml::Reader<&[u8]>, src: &str) -> Self {
-        let offset = reader.buffer_position() as u64;
+        let offset = reader.buffer_position();
         let prefix = &src[..offset.min(src.len() as u64) as usize];
         let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
-        let col = prefix.rfind('\n')
+        let col = prefix
+            .rfind('\n')
             .map(|p| offset as usize - p - 1)
             .unwrap_or(offset as usize)
             + 1;

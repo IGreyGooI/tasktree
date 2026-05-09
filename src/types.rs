@@ -1,9 +1,9 @@
 //! Core data structures for async behavior tree
 
-use std::sync::Arc;
-use serde::Serialize;
-use tokio_util::sync::CancellationToken;
 use crate::blackboard::Blackboard;
+use serde::Serialize;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Result returned by action leaf nodes — no Running, that is the runtime's job
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,20 +109,15 @@ impl<CTX: Send + Sync + 'static> AsyncExecutionContext<CTX> {
 }
 
 /// Parallel execution policy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
 pub enum ParallelPolicy {
     /// All children must succeed (parallel sequence behavior)
+    #[default]
     AllSucceed,
     /// First child to succeed wins, others are cancelled (parallel selector behavior)
     FirstSucceed,
     /// At least one child must succeed, all run to completion (parallel optional behavior)
     AnySucceed,
-}
-
-impl Default for ParallelPolicy {
-    fn default() -> Self {
-        ParallelPolicy::AllSucceed
-    }
 }
 
 /// Task handle for tracking parallel execution

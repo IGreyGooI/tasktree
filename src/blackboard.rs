@@ -2,9 +2,9 @@
 
 use scc::HashMap;
 use serde::Serialize;
-use tokio::sync::RwLock;
 use std::any::Any;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 //re-export serde_json for convenience
 pub use serde_json;
 
@@ -104,12 +104,18 @@ where
         lua.to_value(self)
     }
 
-    fn as_any(&self) -> &dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 
-    fn clone_box(&self) -> Box<dyn BlackboardValue> { Box::new(self.clone()) }
-    
+    fn clone_box(&self) -> Box<dyn BlackboardValue> {
+        Box::new(self.clone())
+    }
+
     fn as_box_any(self: Box<Self>) -> Box<dyn Any> {
         self
     }
@@ -205,7 +211,10 @@ impl<T: LuaBlackboardValue + 'static> LuaOps for TypedLuaOps<T> {
         lua: &mlua::Lua,
         v: mlua::Value,
     ) -> mlua::Result<()> {
-        val.as_any_mut().downcast_mut::<T>().unwrap().update_from_lua(lua, v)
+        val.as_any_mut()
+            .downcast_mut::<T>()
+            .unwrap()
+            .update_from_lua(lua, v)
     }
 }
 
@@ -231,7 +240,10 @@ fn make_entry_lua<T: LuaBlackboardValue + 'static>(value: T) -> BlackboardEntry 
 struct SharedBlackboardData {
     data: HashMap<String, BlackboardEntry>,
     #[cfg(feature = "watch")]
-    watchers: std::collections::HashMap<String, tokio::sync::watch::Sender<Option<Arc<dyn BlackboardValue>>>>,
+    watchers: std::collections::HashMap<
+        String,
+        tokio::sync::watch::Sender<Option<Arc<dyn BlackboardValue>>>,
+    >,
 }
 
 /// Simple concurrent blackboard for sharing typed data between behavior tree nodes.
@@ -309,7 +321,7 @@ impl Blackboard {
         self.read(K::KEY, reader).await
     }
 
-/// Insert a `LuaBlackboardValue` — records the Lua vtable so `get_as_lua`
+    /// Insert a `LuaBlackboardValue` — records the Lua vtable so `get_as_lua`
     /// and `set_from_lua` can round-trip the value without going through JSON.
     #[cfg(feature = "lua")]
     async fn insert_lua<T: LuaBlackboardValue + 'static>(&self, key: &str, value: T) {
@@ -359,7 +371,8 @@ impl Blackboard {
         }).await.flatten();
 
         if result.is_some() {
-            let arc_val = shared.data
+            let arc_val = shared
+                .data
                 .read_async(key, |_, entry| Arc::from(entry.value.clone_box()))
                 .await;
             drop(shared);
@@ -407,7 +420,8 @@ impl Blackboard {
             }
         };
 
-        let arc_val = shared.data
+        let arc_val = shared
+            .data
             .read_async(K::KEY, |_, entry| Arc::from(entry.value.clone_box()))
             .await;
         drop(shared);
@@ -417,7 +431,11 @@ impl Blackboard {
     }
 
     /// Ensure key exists (create with constructor if needed) and read with reader function.
-    pub async fn ensure_and_read_key<K: BlackboardKey, C, R, T>(&self, constructor: C, reader: R) -> T
+    pub async fn ensure_and_read_key<K: BlackboardKey, C, R, T>(
+        &self,
+        constructor: C,
+        reader: R,
+    ) -> T
     where
         C: FnOnce() -> K::Value,
         R: FnOnce(&K::Value) -> T,
@@ -455,10 +473,10 @@ impl Blackboard {
 
     /// Remove a typed value. Panics if the key exists but type doesn't match.
     async fn remove_typed<T: BlackboardValue + 'static>(&self, key: &str) -> Option<T> {
-        self.remove_impl(key).await.and_then(|entry| {
+        self.remove_impl(key).await.map(|entry| {
             let stored_type = entry.value.type_name();
             match entry.value.as_box_any().downcast::<T>() {
-                Ok(value) => Some(*value),
+                Ok(value) => *value,
                 Err(_) => panic!(
                     "Blackboard type mismatch for key '{}': expected type '{}', but found stored type '{}'",
                     key,
@@ -504,10 +522,13 @@ impl Blackboard {
         F: FnMut(&str, &str),
     {
         let shared = self.shared.read().await;
-        shared.data.iter_async(|key, entry| {
-            callback(key, entry.value.type_name());
-            true
-        }).await;
+        shared
+            .data
+            .iter_async(|key, entry| {
+                callback(key, entry.value.type_name());
+                true
+            })
+            .await;
     }
 
     /// Get metadata about all blackboard keys for HTTP API
@@ -518,7 +539,8 @@ impl Blackboard {
                 key: key.to_string(),
                 type_name: type_name.to_string(),
             });
-        }).await;
+        })
+        .await;
         keys.sort_by(|a, b| a.key.cmp(&b.key));
         keys
     }
@@ -528,13 +550,17 @@ impl Blackboard {
     /// The channel is seeded with the current value if the key already exists,
     /// `None` otherwise. Call `receiver.changed().await` to wait for the next write.
     #[cfg(feature = "watch")]
-    pub async fn watch(&self, key: &str) -> tokio::sync::watch::Receiver<Option<Arc<dyn BlackboardValue>>> {
+    pub async fn watch(
+        &self,
+        key: &str,
+    ) -> tokio::sync::watch::Receiver<Option<Arc<dyn BlackboardValue>>> {
         let mut shared = self.shared.write().await;
         if let Some(tx) = shared.watchers.get(key) {
             return tx.subscribe();
         }
         // Seed with current value if the key exists.
-        let current = shared.data
+        let current = shared
+            .data
             .read_async(key, |_, entry| Arc::from(entry.value.clone_box()))
             .await;
         let (tx, rx) = tokio::sync::watch::channel(current);
@@ -556,7 +582,8 @@ impl Blackboard {
     #[cfg(feature = "lua")]
     pub async fn get_as_lua(&self, lua: &mlua::Lua, key: &str) -> mlua::Result<mlua::Value> {
         let shared = self.shared.read().await;
-        let result = shared.data
+        let result = shared
+            .data
             .read_async(key, |_, entry| entry.value.to_lua(lua))
             .await;
         match result {
@@ -572,7 +599,12 @@ impl Blackboard {
     /// opaque (no vtable), returns an error. If the key is new, stores the Lua
     /// value as `serde_json::Value`.
     #[cfg(feature = "lua")]
-    pub async fn set_from_lua(&self, lua: &mlua::Lua, key: &str, val: mlua::Value) -> mlua::Result<()> {
+    pub async fn set_from_lua(
+        &self,
+        lua: &mlua::Lua,
+        key: &str,
+        val: mlua::Value,
+    ) -> mlua::Result<()> {
         use mlua::LuaSerdeExt;
         let mut cell = Some(val.clone());
         let shared = self.shared.read().await;
@@ -595,7 +627,8 @@ impl Blackboard {
 
         match updated {
             Some(result) => {
-                let arc_val = shared.data
+                let arc_val = shared
+                    .data
                     .read_async(key, |_, entry| Arc::from(entry.value.clone_box()))
                     .await;
                 drop(shared);
@@ -615,7 +648,8 @@ impl Blackboard {
     /// Get JSON value and type name for a specific key (HTTP GET endpoint).
     pub async fn get_json_value_with_type(&self, key: &str) -> Option<(serde_json::Value, String)> {
         let shared = self.shared.read().await;
-        shared.data
+        shared
+            .data
             .read_async(key, |_, entry| {
                 let type_name = entry.value.type_name().to_string();
                 entry.value.to_json().map(|value| (value, type_name))
@@ -655,12 +689,20 @@ mod tests {
         let blackboard = Blackboard::new();
 
         blackboard.insert_key::<INT_VALUE>(42).await;
-        blackboard.insert_key::<STRING_VALUE>("hello".to_string()).await;
+        blackboard
+            .insert_key::<STRING_VALUE>("hello".to_string())
+            .await;
 
-        let int_val = blackboard.read_key::<INT_VALUE, _, _>(|v| *v).await.unwrap();
+        let int_val = blackboard
+            .read_key::<INT_VALUE, _, _>(|v| *v)
+            .await
+            .unwrap();
         assert_eq!(int_val, 42);
 
-        let string_val = blackboard.read_key::<STRING_VALUE, _, _>(|v| v.clone()).await.unwrap();
+        let string_val = blackboard
+            .read_key::<STRING_VALUE, _, _>(|v| v.clone())
+            .await
+            .unwrap();
         assert_eq!(string_val, "hello");
 
         assert!(blackboard.contains_key::<INT_VALUE>().await);
@@ -677,11 +719,17 @@ mod tests {
         blackboard.insert_key::<TEST_COUNTER>(0i32).await;
 
         let result = blackboard
-            .update_key::<TEST_COUNTER, _, _>(|v| { *v += 10; *v })
+            .update_key::<TEST_COUNTER, _, _>(|v| {
+                *v += 10;
+                *v
+            })
             .await;
         assert_eq!(result.unwrap(), 10);
 
-        let current = blackboard.read_key::<TEST_COUNTER, _, _>(|v| *v).await.unwrap();
+        let current = blackboard
+            .read_key::<TEST_COUNTER, _, _>(|v| *v)
+            .await
+            .unwrap();
         assert_eq!(current, 10);
     }
 

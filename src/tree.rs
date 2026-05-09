@@ -2,8 +2,8 @@
 
 use crate::types::{AsyncExecutionContext, NodeResult, ParallelPolicy};
 use crate::{condition::Condition, node::AsyncBehaviorNode};
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::{fmt::Debug, sync::Arc};
 use tracing::debug;
 
@@ -29,7 +29,10 @@ impl NodeId {
     fn from_path(path: &str) -> Self {
         let mut h = DefaultHasher::new();
         path.hash(&mut h);
-        NodeId { hash: h.finish(), path: Arc::from(path) }
+        NodeId {
+            hash: h.finish(),
+            path: Arc::from(path),
+        }
     }
 
     pub fn path(&self) -> &str {
@@ -137,25 +140,36 @@ impl<CTX: Send + Sync + 'static> BehaviorTreeNode<CTX> {
 
         match self {
             BehaviorTreeNode::Action { id: slot, .. } => *slot = id,
-            BehaviorTreeNode::Sequence { id: slot, children, .. } => {
+            BehaviorTreeNode::Sequence {
+                id: slot, children, ..
+            } => {
                 *slot = id;
                 for (i, child) in children.iter_mut().enumerate() {
                     child.stamp_ids(Some(slot), i);
                 }
             }
-            BehaviorTreeNode::Selector { id: slot, children, .. } => {
+            BehaviorTreeNode::Selector {
+                id: slot, children, ..
+            } => {
                 *slot = id;
                 for (i, child) in children.iter_mut().enumerate() {
                     child.stamp_ids(Some(slot), i);
                 }
             }
-            BehaviorTreeNode::Parallel { id: slot, children, .. } => {
+            BehaviorTreeNode::Parallel {
+                id: slot, children, ..
+            } => {
                 *slot = id;
                 for (i, child) in children.iter_mut().enumerate() {
                     child.stamp_ids(Some(slot), i);
                 }
             }
-            BehaviorTreeNode::Condition { id: slot, true_branch, false_branch, .. } => {
+            BehaviorTreeNode::Condition {
+                id: slot,
+                true_branch,
+                false_branch,
+                ..
+            } => {
                 *slot = id;
                 true_branch.stamp_ids(Some(slot), 0);
                 if let Some(fb) = false_branch {
@@ -177,7 +191,11 @@ impl<CTX: Send + Sync + 'static> BehaviorTreeNode<CTX> {
             BehaviorTreeNode::Sequence { children, .. } => children.iter().collect(),
             BehaviorTreeNode::Selector { children, .. } => children.iter().collect(),
             BehaviorTreeNode::Parallel { children, .. } => children.iter().collect(),
-            BehaviorTreeNode::Condition { true_branch, false_branch, .. } => {
+            BehaviorTreeNode::Condition {
+                true_branch,
+                false_branch,
+                ..
+            } => {
                 let mut result = vec![true_branch.as_ref()];
                 if let Some(false_branch) = false_branch {
                     result.push(false_branch.as_ref());
@@ -203,20 +221,34 @@ impl<CTX: Send + Sync + 'static> BehaviorTreeNode<CTX> {
         debug!("Executing node: {}", self.name());
         Box::pin(async move {
             match self {
-                BehaviorTreeNode::Action { node, .. } => {
-                    node.execute(ctx).await.into()
-                }
+                BehaviorTreeNode::Action { node, .. } => node.execute(ctx).await.into(),
                 BehaviorTreeNode::Sequence { name, children, .. } => {
                     crate::nodes::sequence::execute_sequence(name, children, ctx).await
                 }
                 BehaviorTreeNode::Selector { name, children, .. } => {
                     crate::nodes::selector::execute_selector(name, children, ctx).await
                 }
-                BehaviorTreeNode::Parallel { name, children, policy, .. } => {
-                    crate::nodes::parallel::execute_parallel(name, children, *policy, ctx).await
-                }
-                BehaviorTreeNode::Condition { name, condition, true_branch, false_branch, .. } => {
-                    crate::nodes::condition::execute_condition(name, condition, true_branch, false_branch, ctx).await
+                BehaviorTreeNode::Parallel {
+                    name,
+                    children,
+                    policy,
+                    ..
+                } => crate::nodes::parallel::execute_parallel(name, children, *policy, ctx).await,
+                BehaviorTreeNode::Condition {
+                    name,
+                    condition,
+                    true_branch,
+                    false_branch,
+                    ..
+                } => {
+                    crate::nodes::condition::execute_condition(
+                        name,
+                        condition,
+                        true_branch,
+                        false_branch,
+                        ctx,
+                    )
+                    .await
                 }
             }
         })

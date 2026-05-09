@@ -82,7 +82,11 @@ pub(super) fn parse_node_start(
             match tag.as_str() {
                 "Sequence" => Ok(NodeDef::Sequence { name, children }),
                 "Selector" => Ok(NodeDef::Selector { name, children }),
-                "Parallel" => Ok(NodeDef::Parallel { name, policy, children }),
+                "Parallel" => Ok(NodeDef::Parallel {
+                    name,
+                    policy,
+                    children,
+                }),
                 _ => unreachable!(),
             }
         }
@@ -138,21 +142,14 @@ pub(super) fn parse_node_empty(
 // ── internal helpers ──────────────────────────────────────────────────────────
 
 /// Read all direct child nodes until the closing tag for `parent_tag`.
-fn parse_children(
-    ctx: &mut ParseCtx<'_>,
-    parent_tag: &str,
-) -> Result<Vec<NodeDef>, RobotBTError> {
+fn parse_children(ctx: &mut ParseCtx<'_>, parent_tag: &str) -> Result<Vec<NodeDef>, RobotBTError> {
     let mut children = Vec::new();
     loop {
         let pos = ctx.pos();
-        match ctx
-            .reader
-            .read_event()
-            .map_err(|e| XmlError::ReaderError {
-                pos: pos.clone(),
-                message: e.to_string(),
-            })?
-        {
+        match ctx.reader.read_event().map_err(|e| XmlError::ReaderError {
+            pos: pos.clone(),
+            message: e.to_string(),
+        })? {
             Event::Start(ref e) => {
                 children.push(parse_node_start(ctx, e)?);
             }
@@ -160,11 +157,12 @@ fn parse_children(
                 children.push(parse_node_empty(ctx, e)?);
             }
             Event::End(ref e) => {
-                let end_tag = std::str::from_utf8(e.local_name().into_inner())
-                    .map_err(|err| XmlError::InvalidUtf8 {
+                let end_tag = std::str::from_utf8(e.local_name().into_inner()).map_err(|err| {
+                    XmlError::InvalidUtf8 {
                         detail: format!("closing tag: {err}"),
                         pos: pos.clone(),
-                    })?;
+                    }
+                })?;
                 if end_tag == parent_tag {
                     break;
                 }
@@ -204,14 +202,10 @@ fn parse_condition_branches(
 
     loop {
         let pos = ctx.pos();
-        match ctx
-            .reader
-            .read_event()
-            .map_err(|e| XmlError::ReaderError {
-                pos: pos.clone(),
-                message: e.to_string(),
-            })?
-        {
+        match ctx.reader.read_event().map_err(|e| XmlError::ReaderError {
+            pos: pos.clone(),
+            message: e.to_string(),
+        })? {
             Event::Start(ref e) => {
                 let tag = std::str::from_utf8(e.local_name().into_inner())
                     .map_err(|err| XmlError::InvalidUtf8 {
@@ -253,11 +247,12 @@ fn parse_condition_branches(
                 .into());
             }
             Event::End(ref e) => {
-                let end_tag = std::str::from_utf8(e.local_name().into_inner())
-                    .map_err(|err| XmlError::InvalidUtf8 {
+                let end_tag = std::str::from_utf8(e.local_name().into_inner()).map_err(|err| {
+                    XmlError::InvalidUtf8 {
                         detail: format!("closing tag: {err}"),
                         pos: pos.clone(),
-                    })?;
+                    }
+                })?;
                 if end_tag == "Condition" {
                     break;
                 }
@@ -306,20 +301,17 @@ fn children_to_node(
 fn drain_to_end(ctx: &mut ParseCtx<'_>, tag: &str) -> Result<(), RobotBTError> {
     loop {
         let pos = ctx.pos();
-        match ctx
-            .reader
-            .read_event()
-            .map_err(|e| XmlError::ReaderError {
-                pos: pos.clone(),
-                message: e.to_string(),
-            })?
-        {
+        match ctx.reader.read_event().map_err(|e| XmlError::ReaderError {
+            pos: pos.clone(),
+            message: e.to_string(),
+        })? {
             Event::End(ref e) => {
-                let end_tag = std::str::from_utf8(e.local_name().into_inner())
-                    .map_err(|err| XmlError::InvalidUtf8 {
+                let end_tag = std::str::from_utf8(e.local_name().into_inner()).map_err(|err| {
+                    XmlError::InvalidUtf8 {
                         detail: format!("closing tag: {err}"),
                         pos: pos.clone(),
-                    })?;
+                    }
+                })?;
                 if end_tag == tag {
                     return Ok(());
                 }
@@ -419,13 +411,10 @@ pub(super) fn parse_root(src: &str) -> Result<NodeDef, RobotBTError> {
     // Find the first real element.
     loop {
         let pos_snapshot = SourcePos::from_reader(&reader, src);
-        match reader
-            .read_event()
-            .map_err(|e| XmlError::ReaderError {
-                pos: pos_snapshot.clone(),
-                message: e.to_string(),
-            })?
-        {
+        match reader.read_event().map_err(|e| XmlError::ReaderError {
+            pos: pos_snapshot.clone(),
+            message: e.to_string(),
+        })? {
             Event::Start(ref e) => {
                 let mut ctx = ParseCtx { reader, src };
                 return parse_node_start(&mut ctx, e);

@@ -6,8 +6,8 @@ use crate::{
     tree::{BehaviorTreeNode, NodeId},
     types::{ActionResult, AsyncExecutionContext, ParallelPolicy},
 };
-use std::{any::type_name_of_val, future::Future};
 use std::sync::Arc;
+use std::{any::type_name_of_val, future::Future};
 
 /// Wrapper for plain async functions used as action nodes.
 ///
@@ -126,7 +126,9 @@ fn extract_function_name(type_name: &str) -> String {
     }
 }
 
-fn make_action<CTX: Send + Sync + 'static>(node: impl IntoAsyncBehaviorNode<CTX>) -> BehaviorTreeNode<CTX> {
+fn make_action<CTX: Send + Sync + 'static>(
+    node: impl IntoAsyncBehaviorNode<CTX>,
+) -> BehaviorTreeNode<CTX> {
     BehaviorTreeNode::Action {
         id: NodeId::default(),
         node: node.into_async_behavior_node(),
@@ -172,16 +174,24 @@ impl BehaviorTreeBuilder {
         Self
     }
 
-    pub fn action<CTX: Send + Sync + 'static>(action: impl IntoAsyncBehaviorNode<CTX>) -> BehaviorTreeNode<CTX> {
+    pub fn action<CTX: Send + Sync + 'static>(
+        action: impl IntoAsyncBehaviorNode<CTX>,
+    ) -> BehaviorTreeNode<CTX> {
         make_action(action)
     }
 
     pub fn sequence<CTX: Send + Sync + 'static, S: Into<String>>(name: S) -> SequenceBuilder<CTX> {
-        SequenceBuilder { name: name.into(), children: Vec::new() }
+        SequenceBuilder {
+            name: name.into(),
+            children: Vec::new(),
+        }
     }
 
     pub fn selector<CTX: Send + Sync + 'static, S: Into<String>>(name: S) -> SelectorBuilder<CTX> {
-        SelectorBuilder { name: name.into(), children: Vec::new() }
+        SelectorBuilder {
+            name: name.into(),
+            children: Vec::new(),
+        }
     }
 
     pub fn parallel<CTX: Send + Sync + 'static, S: Into<String>>(name: S) -> ParallelBuilder<CTX> {
@@ -354,7 +364,9 @@ mod tests {
         async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             ActionResult::Success
         }
-        fn name(&self) -> &str { &self.name }
+        fn name(&self) -> &str {
+            &self.name
+        }
     }
 
     #[derive(Debug)]
@@ -365,8 +377,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Condition<()> for MockCondition {
-        async fn evaluate(&self, _ctx: &AsyncExecutionContext<()>) -> bool { self.result }
-        fn name(&self) -> &str { &self.name }
+        async fn evaluate(&self, _ctx: &AsyncExecutionContext<()>) -> bool {
+            self.result
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
     }
 
     async fn test_move_action(_ctx: AsyncExecutionContext<()>) -> ActionResult {
@@ -379,7 +395,9 @@ mod tests {
 
     #[test]
     fn test_action_builder_with_struct() {
-        let action = Arc::new(MockAction { name: "test_action".to_string() });
+        let action = Arc::new(MockAction {
+            name: "test_action".to_string(),
+        });
         let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::action(action);
         assert!(node.is_action());
         assert_eq!(node.name(), "test_action");
@@ -394,7 +412,8 @@ mod tests {
 
     #[test]
     fn test_action_builder_with_named_function() {
-        let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::action(("custom_move", test_move_action));
+        let node: BehaviorTreeNode<()> =
+            BehaviorTreeBuilder::action(("custom_move", test_move_action));
         assert!(node.is_action());
         assert_eq!(node.name(), "custom_move");
     }
@@ -413,7 +432,9 @@ mod tests {
 
     #[test]
     fn test_selector_builder_mixed() {
-        let action1 = Arc::new(MockAction { name: "struct_action".to_string() });
+        let action1 = Arc::new(MockAction {
+            name: "struct_action".to_string(),
+        });
         let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::selector("test_selector")
             .action(action1)
             .action(test_move_action)
@@ -441,9 +462,10 @@ mod tests {
             name: "test_condition".to_string(),
             result: true,
         });
-        let node: BehaviorTreeNode<()> = BehaviorTreeBuilder::condition("test_condition_node", condition)
-            .when_true(BehaviorTreeBuilder::action(test_move_action))
-            .build();
+        let node: BehaviorTreeNode<()> =
+            BehaviorTreeBuilder::condition("test_condition_node", condition)
+                .when_true(BehaviorTreeBuilder::action(test_move_action))
+                .build();
         assert_eq!(node.name(), "test_condition_node");
         assert_eq!(node.children().len(), 1);
     }
@@ -455,8 +477,14 @@ mod tests {
             "test_move_action"
         );
         assert_eq!(extract_function_name("closure"), "closure");
-        assert_eq!(extract_function_name("fn() -> ActionResult"), "function_pointer");
-        assert_eq!(extract_function_name("some_module::MyFunction<T>"), "MyFunction");
+        assert_eq!(
+            extract_function_name("fn() -> ActionResult"),
+            "function_pointer"
+        );
+        assert_eq!(
+            extract_function_name("some_module::MyFunction<T>"),
+            "MyFunction"
+        );
     }
 
     #[test]

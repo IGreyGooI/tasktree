@@ -150,8 +150,7 @@ impl LuaRuntime {
     pub fn load_script(&mut self, script: &str) -> Result<(), RobotBTError> {
         use std::sync::Mutex;
 
-        let pending_actions: Arc<Mutex<Vec<(String, Function)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let pending_actions: Arc<Mutex<Vec<(String, Function)>>> = Arc::new(Mutex::new(Vec::new()));
         let pending_conditions: Arc<Mutex<Vec<(String, Function)>>> =
             Arc::new(Mutex::new(Vec::new()));
 
@@ -162,18 +161,20 @@ impl LuaRuntime {
 
         tt.set(
             "register_action",
-            self.lua.create_function(move |_lua, (name, func): (String, Function)| {
-                pa.lock().unwrap().push((name, func));
-                Ok(())
-            })?,
+            self.lua
+                .create_function(move |_lua, (name, func): (String, Function)| {
+                    pa.lock().unwrap().push((name, func));
+                    Ok(())
+                })?,
         )?;
 
         tt.set(
             "register_condition",
-            self.lua.create_function(move |_lua, (name, func): (String, Function)| {
-                pc.lock().unwrap().push((name, func));
-                Ok(())
-            })?,
+            self.lua
+                .create_function(move |_lua, (name, func): (String, Function)| {
+                    pc.lock().unwrap().push((name, func));
+                    Ok(())
+                })?,
         )?;
 
         self.lua.globals().set("tasktree", tt)?;
@@ -209,19 +210,30 @@ impl LuaRuntime {
             "Action" => {
                 let name: String = table.get("name")?;
                 let node = self.resolve_action(&name)?;
-                Ok(BehaviorTreeNode::Action { id: NodeId::default(), node })
+                Ok(BehaviorTreeNode::Action {
+                    id: NodeId::default(),
+                    node,
+                })
             }
 
             "Sequence" => {
                 let name: String = table.get("name")?;
                 let children = self.get_children(table)?;
-                Ok(BehaviorTreeNode::Sequence { id: NodeId::default(), name, children })
+                Ok(BehaviorTreeNode::Sequence {
+                    id: NodeId::default(),
+                    name,
+                    children,
+                })
             }
 
             "Selector" => {
                 let name: String = table.get("name")?;
                 let children = self.get_children(table)?;
-                Ok(BehaviorTreeNode::Selector { id: NodeId::default(), name, children })
+                Ok(BehaviorTreeNode::Selector {
+                    id: NodeId::default(),
+                    name,
+                    children,
+                })
             }
 
             "Parallel" => {
@@ -231,13 +243,18 @@ impl LuaRuntime {
                     Some("FirstSucceed") => ParallelPolicy::FirstSucceed,
                     Some("AnySucceed") => ParallelPolicy::AnySucceed,
                     Some(other) => {
-                        return Err(RobotBTError::LuaError(
-                            format!("unknown parallel policy '{other}'"),
-                        ))
+                        return Err(RobotBTError::LuaError(format!(
+                            "unknown parallel policy '{other}'"
+                        )));
                     }
                 };
                 let children = self.get_children(table)?;
-                Ok(BehaviorTreeNode::Parallel { id: NodeId::default(), name, policy, children })
+                Ok(BehaviorTreeNode::Parallel {
+                    id: NodeId::default(),
+                    name,
+                    policy,
+                    children,
+                })
             }
 
             "Condition" => {
@@ -259,7 +276,9 @@ impl LuaRuntime {
                 })
             }
 
-            other => Err(RobotBTError::LuaError(format!("unknown node type '{other}'"))),
+            other => Err(RobotBTError::LuaError(format!(
+                "unknown node type '{other}'"
+            ))),
         }
     }
 
@@ -284,8 +303,9 @@ impl LuaRuntime {
                 func: func.clone(),
             }));
         }
-        crate::registry::resolve_action(name)
-            .ok_or_else(|| RobotBTError::UnknownAction { name: name.to_string() })
+        crate::registry::resolve_action(name).ok_or_else(|| RobotBTError::UnknownAction {
+            name: name.to_string(),
+        })
     }
 
     fn resolve_condition(&self, name: &str) -> Result<Arc<dyn Condition>, RobotBTError> {
@@ -296,8 +316,9 @@ impl LuaRuntime {
                 func: func.clone(),
             }));
         }
-        crate::registry::resolve_condition(name)
-            .ok_or_else(|| RobotBTError::UnknownCondition { name: name.to_string() })
+        crate::registry::resolve_condition(name).ok_or_else(|| RobotBTError::UnknownCondition {
+            name: name.to_string(),
+        })
     }
 }
 
@@ -317,18 +338,31 @@ mod tests {
         let lua = Lua::new();
 
         // set from Lua side (new key → stored as serde_json::Value)
-        bb.set_from_lua(&lua, "count", Value::Integer(42)).await.unwrap();
-        bb.set_from_lua(&lua, "flag", Value::Boolean(true)).await.unwrap();
-        bb.set_from_lua(&lua, "label", Value::String(lua.create_string("hello").unwrap())).await.unwrap();
+        bb.set_from_lua(&lua, "count", Value::Integer(42))
+            .await
+            .unwrap();
+        bb.set_from_lua(&lua, "flag", Value::Boolean(true))
+            .await
+            .unwrap();
+        bb.set_from_lua(
+            &lua,
+            "label",
+            Value::String(lua.create_string("hello").unwrap()),
+        )
+        .await
+        .unwrap();
 
         let count = bb.get_as_lua(&lua, "count").await.unwrap();
-        let flag  = bb.get_as_lua(&lua, "flag").await.unwrap();
+        let flag = bb.get_as_lua(&lua, "flag").await.unwrap();
         let label = bb.get_as_lua(&lua, "label").await.unwrap();
 
         assert!(matches!(count, Value::Integer(42)));
-        assert!(matches!(flag,  Value::Boolean(true)));
-        if let Value::String(s) = label { assert_eq!(s.to_str().unwrap(), "hello"); }
-        else { panic!("expected string"); }
+        assert!(matches!(flag, Value::Boolean(true)));
+        if let Value::String(s) = label {
+            assert_eq!(s.to_str().unwrap(), "hello");
+        } else {
+            panic!("expected string");
+        }
     }
 
     #[tokio::test]
@@ -346,7 +380,9 @@ mod tests {
 
         // Lua table → stored as serde_json::Value
         let table: Table = lua.load(r#"{x = 1, y = 2}"#).eval().unwrap();
-        bb.set_from_lua(&lua, "pos", Value::Table(table)).await.unwrap();
+        bb.set_from_lua(&lua, "pos", Value::Table(table))
+            .await
+            .unwrap();
 
         let val = bb.get_as_lua(&lua, "pos").await.unwrap();
         if let Value::Table(t) = val {
@@ -366,7 +402,9 @@ mod tests {
 
         let lua = Lua::new();
         // Lua mutates an existing Rust-typed i64
-        bb.set_from_lua(&lua, "test/counter", Value::Integer(99)).await.unwrap();
+        bb.set_from_lua(&lua, "test/counter", Value::Integer(99))
+            .await
+            .unwrap();
 
         let val = bb.read_key::<COUNTER, _, _>(|v| *v).await.unwrap();
         assert_eq!(val, 99);
@@ -377,16 +415,24 @@ mod tests {
     #[tokio::test]
     async fn lua_action_success() {
         let mut rt = LuaRuntime::new().unwrap();
-        rt.load_script(r#"
+        rt.load_script(
+            r#"
             tasktree.register_action("always_ok", function(bb)
                 return true
             end)
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let bb = Blackboard::new();
-        let mut runtime = rt.load_tree(r#"
+        let mut runtime = rt
+            .load_tree(
+                r#"
             return { type = "Action", name = "always_ok" }
-        "#, bb).unwrap();
+        "#,
+                bb,
+            )
+            .unwrap();
 
         let result = runtime.tick().await;
         assert_eq!(result, NodeResult::Success);
@@ -395,16 +441,24 @@ mod tests {
     #[tokio::test]
     async fn lua_action_failure() {
         let mut rt = LuaRuntime::new().unwrap();
-        rt.load_script(r#"
+        rt.load_script(
+            r#"
             tasktree.register_action("always_fail", function(bb)
                 return false
             end)
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let bb = Blackboard::new();
-        let mut runtime = rt.load_tree(r#"
+        let mut runtime = rt
+            .load_tree(
+                r#"
             return { type = "Action", name = "always_fail" }
-        "#, bb).unwrap();
+        "#,
+                bb,
+            )
+            .unwrap();
 
         let result = runtime.tick().await;
         assert_eq!(result, NodeResult::Failure);
@@ -415,22 +469,30 @@ mod tests {
     #[tokio::test]
     async fn lua_action_reads_and_writes_blackboard() {
         let mut rt = LuaRuntime::new().unwrap();
-        rt.load_script(r#"
+        rt.load_script(
+            r#"
             tasktree.register_action("increment", function(bb)
                 local n = bb:get("n")
                 if n == nil then n = 0 end
                 bb:set("n", n + 1)
                 return true
             end)
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let bb = Blackboard::new();
         let lua = Lua::new();
         bb.set_from_lua(&lua, "n", Value::Integer(5)).await.unwrap();
 
-        let mut runtime = rt.load_tree(r#"
+        let mut runtime = rt
+            .load_tree(
+                r#"
             return { type = "Action", name = "increment" }
-        "#, bb.clone()).unwrap();
+        "#,
+                bb.clone(),
+            )
+            .unwrap();
 
         runtime.tick().await;
 
@@ -443,13 +505,18 @@ mod tests {
     #[tokio::test]
     async fn lua_sequence_all_succeed() {
         let mut rt = LuaRuntime::new().unwrap();
-        rt.load_script(r#"
+        rt.load_script(
+            r#"
             tasktree.register_action("a", function(bb) return true end)
             tasktree.register_action("b", function(bb) return true end)
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let bb = Blackboard::new();
-        let mut runtime = rt.load_tree(r#"
+        let mut runtime = rt
+            .load_tree(
+                r#"
             return {
                 type = "Sequence", name = "seq",
                 children = {
@@ -457,7 +524,10 @@ mod tests {
                     { type = "Action", name = "b" },
                 }
             }
-        "#, bb).unwrap();
+        "#,
+                bb,
+            )
+            .unwrap();
 
         assert_eq!(runtime.tick().await, NodeResult::Success);
     }
@@ -465,13 +535,18 @@ mod tests {
     #[tokio::test]
     async fn lua_sequence_short_circuits_on_failure() {
         let mut rt = LuaRuntime::new().unwrap();
-        rt.load_script(r#"
+        rt.load_script(
+            r#"
             tasktree.register_action("ok",   function(bb) return true  end)
             tasktree.register_action("fail", function(bb) return false end)
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let bb = Blackboard::new();
-        let mut runtime = rt.load_tree(r#"
+        let mut runtime = rt
+            .load_tree(
+                r#"
             return {
                 type = "Sequence", name = "seq",
                 children = {
@@ -480,7 +555,10 @@ mod tests {
                     { type = "Action", name = "ok" },
                 }
             }
-        "#, bb).unwrap();
+        "#,
+                bb,
+            )
+            .unwrap();
 
         assert_eq!(runtime.tick().await, NodeResult::Failure);
     }
@@ -490,21 +568,29 @@ mod tests {
     #[tokio::test]
     async fn lua_condition_takes_true_branch() {
         let mut rt = LuaRuntime::new().unwrap();
-        rt.load_script(r#"
+        rt.load_script(
+            r#"
             tasktree.register_condition("is_ready", function(bb) return true end)
             tasktree.register_action("do_work",  function(bb) return true end)
             tasktree.register_action("fallback", function(bb) return false end)
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let bb = Blackboard::new();
-        let mut runtime = rt.load_tree(r#"
+        let mut runtime = rt
+            .load_tree(
+                r#"
             return {
                 type = "Condition", name = "check",
                 condition_name = "is_ready",
                 true_branch  = { type = "Action", name = "do_work" },
                 false_branch = { type = "Action", name = "fallback" },
             }
-        "#, bb).unwrap();
+        "#,
+                bb,
+            )
+            .unwrap();
 
         assert_eq!(runtime.tick().await, NodeResult::Success);
     }
@@ -515,9 +601,14 @@ mod tests {
     fn lua_load_tree_unknown_action_errors() {
         let rt = LuaRuntime::new().unwrap();
         let bb = Blackboard::new();
-        let err = rt.load_tree(r#"
+        let err = rt
+            .load_tree(
+                r#"
             return { type = "Action", name = "ghost" }
-        "#, bb).unwrap_err();
+        "#,
+                bb,
+            )
+            .unwrap_err();
         assert!(matches!(err, RobotBTError::UnknownAction { .. }));
     }
 }

@@ -110,7 +110,8 @@ impl NodeDef {
     ) -> Result<BehaviorTreeNode<CTX>, RobotBTError> {
         match self {
             NodeDef::Action { name } => {
-                let node = registry.resolve_action(&name)
+                let node = registry
+                    .resolve_action(&name)
                     .ok_or_else(|| RobotBTError::UnknownAction { name: name.clone() })?;
                 Ok(BehaviorTreeNode::Action {
                     id: NodeId::default(),
@@ -136,7 +137,11 @@ impl NodeDef {
                     .collect::<Result<_, _>>()?,
             }),
 
-            NodeDef::Parallel { name, policy, children } => Ok(BehaviorTreeNode::Parallel {
+            NodeDef::Parallel {
+                name,
+                policy,
+                children,
+            } => Ok(BehaviorTreeNode::Parallel {
                 id: NodeId::default(),
                 name,
                 policy,
@@ -146,9 +151,17 @@ impl NodeDef {
                     .collect::<Result<_, _>>()?,
             }),
 
-            NodeDef::Condition { name, condition_name, true_branch, false_branch } => {
-                let condition = registry.resolve_condition(&condition_name)
-                    .ok_or_else(|| RobotBTError::UnknownCondition { name: condition_name })?;
+            NodeDef::Condition {
+                name,
+                condition_name,
+                true_branch,
+                false_branch,
+            } => {
+                let condition = registry.resolve_condition(&condition_name).ok_or(
+                    RobotBTError::UnknownCondition {
+                        name: condition_name,
+                    },
+                )?;
                 Ok(BehaviorTreeNode::Condition {
                     id: NodeId::default(),
                     name,
@@ -170,7 +183,6 @@ mod xml_parser;
 
 // Re-export helpers into NodeDef::from_xml scope
 #[cfg(feature = "xml")]
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,7 +201,9 @@ mod tests {
         async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             ActionResult::Success
         }
-        fn name(&self) -> &str { "noop" }
+        fn name(&self) -> &str {
+            "noop"
+        }
     }
 
     #[derive(Debug)]
@@ -197,8 +211,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::condition::Condition<()> for AlwaysTrue {
-        async fn evaluate(&self, _ctx: &AsyncExecutionContext<()>) -> bool { true }
-        fn name(&self) -> &str { "always_true" }
+        async fn evaluate(&self, _ctx: &AsyncExecutionContext<()>) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "always_true"
+        }
     }
 
     fn make_registry() -> BtRegistry<()> {
@@ -296,7 +314,11 @@ true_branch:
 ";
         let def = NodeDef::from_yaml(yaml).unwrap();
         match def {
-            NodeDef::Condition { condition_name, false_branch, .. } => {
+            NodeDef::Condition {
+                condition_name,
+                false_branch,
+                ..
+            } => {
                 assert_eq!(condition_name, "always_true");
                 assert!(false_branch.is_none());
             }
@@ -331,8 +353,12 @@ false_branch:
         let original = NodeDef::Sequence {
             name: "root".into(),
             children: vec![
-                NodeDef::Action { name: "noop".into() },
-                NodeDef::Action { name: "noop".into() },
+                NodeDef::Action {
+                    name: "noop".into(),
+                },
+                NodeDef::Action {
+                    name: "noop".into(),
+                },
             ],
         };
         let yaml = original.to_yaml().unwrap();
@@ -351,7 +377,11 @@ false_branch:
     #[test]
     fn into_tree_action_resolved() {
         let reg = make_registry();
-        let node = NodeDef::Action { name: "noop".into() }.into_tree(&reg).unwrap();
+        let node = NodeDef::Action {
+            name: "noop".into(),
+        }
+        .into_tree(&reg)
+        .unwrap();
         assert!(node.is_action());
         assert_eq!(node.name(), "noop");
     }
@@ -361,7 +391,9 @@ false_branch:
         let reg = make_registry();
         let def = NodeDef::Sequence {
             name: "seq".into(),
-            children: vec![NodeDef::Action { name: "noop".into() }],
+            children: vec![NodeDef::Action {
+                name: "noop".into(),
+            }],
         };
         let node = def.into_tree(&reg).unwrap();
         assert_eq!(node.name(), "seq");
@@ -374,7 +406,9 @@ false_branch:
         let def = NodeDef::Condition {
             name: "cond".into(),
             condition_name: "always_true".into(),
-            true_branch: Box::new(NodeDef::Action { name: "noop".into() }),
+            true_branch: Box::new(NodeDef::Action {
+                name: "noop".into(),
+            }),
             false_branch: None,
         };
         let node = def.into_tree(&reg).unwrap();
@@ -384,8 +418,14 @@ false_branch:
     #[test]
     fn into_tree_unknown_action_returns_err() {
         let reg = make_registry();
-        let err = NodeDef::Action { name: "missing".into() }.into_tree(&reg).unwrap_err();
-        assert!(matches!(err, crate::error::RobotBTError::UnknownAction { name } if name == "missing"));
+        let err = NodeDef::Action {
+            name: "missing".into(),
+        }
+        .into_tree(&reg)
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::RobotBTError::UnknownAction { name } if name == "missing")
+        );
     }
 
     #[test]
@@ -394,10 +434,16 @@ false_branch:
         let err = NodeDef::Condition {
             name: "c".into(),
             condition_name: "missing".into(),
-            true_branch: Box::new(NodeDef::Action { name: "noop".into() }),
+            true_branch: Box::new(NodeDef::Action {
+                name: "noop".into(),
+            }),
             false_branch: None,
-        }.into_tree(&reg).unwrap_err();
-        assert!(matches!(err, crate::error::RobotBTError::UnknownCondition { name } if name == "missing"));
+        }
+        .into_tree(&reg)
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::RobotBTError::UnknownCondition { name } if name == "missing")
+        );
     }
 
     // ── BehaviorTreeRuntime::from_yaml ────────────────────────────────────
@@ -419,7 +465,8 @@ children:
             Blackboard::new(),
             Arc::new(()),
             &reg,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = rt.tick().await;
         assert_eq!(result, crate::types::NodeResult::Success);
@@ -475,7 +522,11 @@ children:
 </Condition>"#;
         let def = NodeDef::from_xml(xml).unwrap();
         match def {
-            NodeDef::Condition { condition_name, false_branch, .. } => {
+            NodeDef::Condition {
+                condition_name,
+                false_branch,
+                ..
+            } => {
                 assert_eq!(condition_name, "always_true");
                 assert!(false_branch.is_none());
             }
@@ -539,7 +590,8 @@ children:
             Blackboard::new(),
             Arc::new(()),
             &reg,
-        ).unwrap();
+        )
+        .unwrap();
         let result = rt.tick().await;
         assert_eq!(result, crate::types::NodeResult::Success);
     }
@@ -561,7 +613,8 @@ children:
             Blackboard::new(),
             Arc::new(()),
             &reg,
-        ).unwrap();
+        )
+        .unwrap();
         let result = rt.tick().await;
         assert_eq!(result, crate::types::NodeResult::Success);
     }

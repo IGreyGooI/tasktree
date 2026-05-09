@@ -298,7 +298,12 @@ fn eval<'a, CTX: Send + Sync + 'static>(
             // ------------------------------------------------------------------
             // Parallel — run all children; apply policy
             // ------------------------------------------------------------------
-            BehaviorTreeNode::Parallel { name, children, policy, .. } => {
+            BehaviorTreeNode::Parallel {
+                name,
+                children,
+                policy,
+                ..
+            } => {
                 trace!("Parallel {} ({:?})", name, policy);
                 if children.is_empty() {
                     return NodeResult::Success;
@@ -313,7 +318,8 @@ fn eval<'a, CTX: Send + Sync + 'static>(
                         NodeResult::Running => running += 1,
                     }
                 }
-                let result = apply_parallel_policy(*policy, successes, failures, running, children.len());
+                let result =
+                    apply_parallel_policy(*policy, successes, failures, running, children.len());
                 // If policy triggered early exit (not still Running), cancel
                 // all sibling handles that are still in-flight.
                 if result != NodeResult::Running {
@@ -327,7 +333,13 @@ fn eval<'a, CTX: Send + Sync + 'static>(
             // ------------------------------------------------------------------
             // Condition — evaluate predicate, execute branch
             // ------------------------------------------------------------------
-            BehaviorTreeNode::Condition { name, condition, true_branch, false_branch, .. } => {
+            BehaviorTreeNode::Condition {
+                name,
+                condition,
+                true_branch,
+                false_branch,
+                ..
+            } => {
                 trace!("Condition {}", name);
                 if condition.evaluate(&ctx).await {
                     eval(true_branch, handles, ctx).await
@@ -368,8 +380,9 @@ async fn eval_action<CTX: Send + Sync + 'static>(
     // No existing handle — probe once with a noop waker.
     let name = action.name().to_string();
     let spawn_ctx = ctx.child_context();
-    let mut fut: std::pin::Pin<Box<dyn std::future::Future<Output = ActionResult> + Send + 'static>> =
-        Box::pin(async move { action.execute(spawn_ctx).await });
+    let mut fut: std::pin::Pin<
+        Box<dyn std::future::Future<Output = ActionResult> + Send + 'static>,
+    > = Box::pin(async move { action.execute(spawn_ctx).await });
 
     if let Some(result) = poll_once(fut.as_mut()) {
         // Completed synchronously — fast path, no spawn.
@@ -440,7 +453,12 @@ fn cancel_subtree_handles<CTX: Send + Sync + 'static>(
     for child in node.children() {
         cancel_subtree_handles(child, handles);
     }
-    if let BehaviorTreeNode::Condition { true_branch, false_branch, .. } = node {
+    if let BehaviorTreeNode::Condition {
+        true_branch,
+        false_branch,
+        ..
+    } = node
+    {
         cancel_subtree_handles(true_branch, handles);
         if let Some(fb) = false_branch {
             cancel_subtree_handles(fb, handles);
@@ -485,7 +503,9 @@ mod tests {
         async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             ActionResult::Success
         }
-        fn name(&self) -> &str { "AlwaysSuccess" }
+        fn name(&self) -> &str {
+            "AlwaysSuccess"
+        }
     }
 
     #[derive(Debug)]
@@ -496,7 +516,9 @@ mod tests {
         async fn execute(&self, _ctx: AsyncExecutionContext<()>) -> ActionResult {
             ActionResult::Failure
         }
-        fn name(&self) -> &str { "AlwaysFailure" }
+        fn name(&self) -> &str {
+            "AlwaysFailure"
+        }
     }
 
     /// Completes after a short async delay — forces the spawn path.
@@ -509,7 +531,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             ActionResult::Success
         }
-        fn name(&self) -> &str { "DelayedSuccess" }
+        fn name(&self) -> &str {
+            "DelayedSuccess"
+        }
     }
 
     #[derive(Debug)]
@@ -521,7 +545,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             ActionResult::Failure
         }
-        fn name(&self) -> &str { "DelayedFailure" }
+        fn name(&self) -> &str {
+            "DelayedFailure"
+        }
     }
 
     /// Counts how many times execute() was called.
@@ -534,7 +560,9 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             ActionResult::Success
         }
-        fn name(&self) -> &str { "CountedSuccess" }
+        fn name(&self) -> &str {
+            "CountedSuccess"
+        }
     }
 
     // --- tests ---
@@ -640,10 +668,7 @@ mod tests {
         let root = BehaviorTreeNode::Selector {
             id: NodeId::root("sel"),
             name: "sel".into(),
-            children: vec![
-                action_node(DelayedSuccess),
-                action_node(AlwaysSuccess),
-            ],
+            children: vec![action_node(DelayedSuccess), action_node(AlwaysSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
@@ -661,10 +686,7 @@ mod tests {
         let root = BehaviorTreeNode::Selector {
             id: NodeId::root("sel"),
             name: "sel".into(),
-            children: vec![
-                action_node(DelayedFailure),
-                action_node(AlwaysSuccess),
-            ],
+            children: vec![action_node(DelayedFailure), action_node(AlwaysSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
@@ -683,10 +705,7 @@ mod tests {
             id: NodeId::root("par"),
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AllSucceed,
-            children: vec![
-                action_node(AlwaysSuccess),
-                action_node(DelayedSuccess),
-            ],
+            children: vec![action_node(AlwaysSuccess), action_node(DelayedSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
@@ -705,10 +724,7 @@ mod tests {
             id: NodeId::root("par"),
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AllSucceed,
-            children: vec![
-                action_node(AlwaysFailure),
-                action_node(DelayedSuccess),
-            ],
+            children: vec![action_node(AlwaysFailure), action_node(DelayedSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
@@ -721,10 +737,7 @@ mod tests {
             id: NodeId::root("par"),
             name: "par".into(),
             policy: crate::types::ParallelPolicy::FirstSucceed,
-            children: vec![
-                action_node(DelayedSuccess),
-                action_node(AlwaysSuccess),
-            ],
+            children: vec![action_node(DelayedSuccess), action_node(AlwaysSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
@@ -737,10 +750,7 @@ mod tests {
             id: NodeId::root("par"),
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AnySucceed,
-            children: vec![
-                action_node(AlwaysSuccess),
-                action_node(DelayedFailure),
-            ],
+            children: vec![action_node(AlwaysSuccess), action_node(DelayedFailure)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
@@ -762,10 +772,7 @@ mod tests {
                     id: NodeId::root("par"),
                     name: "par".into(),
                     policy: crate::types::ParallelPolicy::AllSucceed,
-                    children: vec![
-                        action_node(AlwaysFailure),
-                        action_node(DelayedSuccess),
-                    ],
+                    children: vec![action_node(AlwaysFailure), action_node(DelayedSuccess)],
                 },
                 action_node(AlwaysSuccess),
             ],
@@ -774,7 +781,11 @@ mod tests {
 
         let result = rt.tick().await;
         assert_eq!(result, NodeResult::Success);
-        assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
+        assert!(
+            rt.handles.is_empty(),
+            "leaked handles: {}",
+            rt.handles.len()
+        );
     }
 
     #[tokio::test]
@@ -783,15 +794,16 @@ mod tests {
             id: NodeId::root("par"),
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AllSucceed,
-            children: vec![
-                action_node(AlwaysFailure),
-                action_node(DelayedSuccess),
-            ],
+            children: vec![action_node(AlwaysFailure), action_node(DelayedSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
         assert_eq!(rt.tick().await, NodeResult::Failure);
-        assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
+        assert!(
+            rt.handles.is_empty(),
+            "leaked handles: {}",
+            rt.handles.len()
+        );
     }
 
     #[tokio::test]
@@ -800,15 +812,16 @@ mod tests {
             id: NodeId::root("par"),
             name: "par".into(),
             policy: crate::types::ParallelPolicy::FirstSucceed,
-            children: vec![
-                action_node(DelayedSuccess),
-                action_node(AlwaysSuccess),
-            ],
+            children: vec![action_node(DelayedSuccess), action_node(AlwaysSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
         assert_eq!(rt.tick().await, NodeResult::Success);
-        assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
+        assert!(
+            rt.handles.is_empty(),
+            "leaked handles: {}",
+            rt.handles.len()
+        );
     }
 
     #[tokio::test]
@@ -829,7 +842,11 @@ mod tests {
         assert_eq!(rt.handles.len(), 3);
 
         rt.cancel();
-        assert!(rt.handles.is_empty(), "leaked handles after cancel: {}", rt.handles.len());
+        assert!(
+            rt.handles.is_empty(),
+            "leaked handles after cancel: {}",
+            rt.handles.len()
+        );
     }
 
     #[tokio::test]
@@ -838,10 +855,7 @@ mod tests {
             id: NodeId::root("par"),
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AllSucceed,
-            children: vec![
-                action_node(DelayedSuccess),
-                action_node(DelayedSuccess),
-            ],
+            children: vec![action_node(DelayedSuccess), action_node(DelayedSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
@@ -856,7 +870,11 @@ mod tests {
         // Next tick must run cleanly from root (not return Failure due to cancelled token).
         // The actions are new invocations so they go through the spawn path again.
         let r = rt.tick().await;
-        assert!(r == NodeResult::Running, "expected Running after interrupt, got {:?}", r);
+        assert!(
+            r == NodeResult::Running,
+            "expected Running after interrupt, got {:?}",
+            r
+        );
         assert_eq!(rt.handles.len(), 2);
     }
 
@@ -875,10 +893,7 @@ mod tests {
                             id: NodeId::root("inner_par"),
                             name: "inner_par".into(),
                             policy: crate::types::ParallelPolicy::AllSucceed,
-                            children: vec![
-                                action_node(AlwaysFailure),
-                                action_node(DelayedSuccess),
-                            ],
+                            children: vec![action_node(AlwaysFailure), action_node(DelayedSuccess)],
                         },
                         action_node(DelayedSuccess),
                     ],
@@ -889,7 +904,11 @@ mod tests {
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
         assert_eq!(rt.tick().await, NodeResult::Success);
-        assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
+        assert!(
+            rt.handles.is_empty(),
+            "leaked handles: {}",
+            rt.handles.len()
+        );
     }
 
     #[tokio::test]
@@ -903,10 +922,7 @@ mod tests {
                     id: NodeId::root("par"),
                     name: "par".into(),
                     policy: crate::types::ParallelPolicy::AllSucceed,
-                    children: vec![
-                        action_node(DelayedFailure),
-                        action_node(DelayedSuccess),
-                    ],
+                    children: vec![action_node(DelayedFailure), action_node(DelayedSuccess)],
                 },
                 action_node(AlwaysSuccess),
             ],
@@ -919,7 +935,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert_eq!(rt.tick().await, NodeResult::Failure);
-        assert!(rt.handles.is_empty(), "leaked handles: {}", rt.handles.len());
+        assert!(
+            rt.handles.is_empty(),
+            "leaked handles: {}",
+            rt.handles.len()
+        );
     }
 
     #[tokio::test]
@@ -928,10 +948,7 @@ mod tests {
             id: NodeId::root("par"),
             name: "par".into(),
             policy: crate::types::ParallelPolicy::AllSucceed,
-            children: vec![
-                action_node(DelayedSuccess),
-                action_node(DelayedSuccess),
-            ],
+            children: vec![action_node(DelayedSuccess), action_node(DelayedSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 
@@ -954,7 +971,9 @@ mod tests {
     #[cfg(feature = "watch")]
     #[async_trait]
     impl AsyncBehaviorNode<()> for WatchAction {
-        fn name(&self) -> &str { "WatchAction" }
+        fn name(&self) -> &str {
+            "WatchAction"
+        }
         async fn execute(&self, ctx: AsyncExecutionContext<()>) -> ActionResult {
             let mut rx = ctx.blackboard.watch(self.key).await;
             rx.changed().await.unwrap();
@@ -991,10 +1010,7 @@ mod tests {
         let root = BehaviorTreeNode::Selector {
             id: NodeId::root("sel"),
             name: "sel".into(),
-            children: vec![
-                action_node(AlwaysSuccess),
-                action_node(DelayedSuccess),
-            ],
+            children: vec![action_node(AlwaysSuccess), action_node(DelayedSuccess)],
         };
         let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
 

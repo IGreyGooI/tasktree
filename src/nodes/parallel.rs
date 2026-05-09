@@ -36,7 +36,13 @@ pub async fn execute_parallel<CTX: Send + Sync + 'static>(
         let child_ctx = ctx.child_context();
         let result = child.execute(child_ctx).await;
 
-        trace!("Parallel {} child {} ({}) result: {:?}", name, i, child.name(), result);
+        trace!(
+            "Parallel {} child {} ({}) result: {:?}",
+            name,
+            i,
+            child.name(),
+            result
+        );
 
         match result {
             NodeResult::Success => success_count += 1,
@@ -45,49 +51,74 @@ pub async fn execute_parallel<CTX: Send + Sync + 'static>(
         }
     }
 
-    debug!("Parallel {} tick results: {} success, {} failure, {} running",
-           name, success_count, failure_count, running_count);
+    debug!(
+        "Parallel {} tick results: {} success, {} failure, {} running",
+        name, success_count, failure_count, running_count
+    );
 
     match policy {
         ParallelPolicy::AllSucceed => {
             if failure_count > 0 {
-                debug!("Parallel {} failed - child failed (policy: AllSucceed)", name);
+                debug!(
+                    "Parallel {} failed - child failed (policy: AllSucceed)",
+                    name
+                );
                 NodeResult::Failure
             } else if success_count == total_children {
-                debug!("Parallel {} succeeded - all children succeeded (policy: AllSucceed)", name);
+                debug!(
+                    "Parallel {} succeeded - all children succeeded (policy: AllSucceed)",
+                    name
+                );
                 NodeResult::Success
             } else {
-                trace!("Parallel {} continuing - {}/{} succeeded, {} running (policy: AllSucceed)",
-                       name, success_count, total_children, running_count);
+                trace!(
+                    "Parallel {} continuing - {}/{} succeeded, {} running (policy: AllSucceed)",
+                    name, success_count, total_children, running_count
+                );
                 NodeResult::Running
             }
         }
 
         ParallelPolicy::FirstSucceed => {
             if success_count > 0 {
-                debug!("Parallel {} succeeded - first child succeeded (policy: FirstSucceed)", name);
+                debug!(
+                    "Parallel {} succeeded - first child succeeded (policy: FirstSucceed)",
+                    name
+                );
                 NodeResult::Success
             } else if running_count == 0 {
-                debug!("Parallel {} failed - no children succeeded (policy: FirstSucceed)", name);
+                debug!(
+                    "Parallel {} failed - no children succeeded (policy: FirstSucceed)",
+                    name
+                );
                 NodeResult::Failure
             } else {
-                trace!("Parallel {} continuing - waiting for first success, {} running (policy: FirstSucceed)",
-                       name, running_count);
+                trace!(
+                    "Parallel {} continuing - waiting for first success, {} running (policy: FirstSucceed)",
+                    name, running_count
+                );
                 NodeResult::Running
             }
         }
 
         ParallelPolicy::AnySucceed => {
             if running_count > 0 {
-                trace!("Parallel {} continuing - {} children still running (policy: AnySucceed)",
-                       name, running_count);
+                trace!(
+                    "Parallel {} continuing - {} children still running (policy: AnySucceed)",
+                    name, running_count
+                );
                 NodeResult::Running
             } else if success_count > 0 {
-                debug!("Parallel {} succeeded - {} children succeeded (policy: AnySucceed)",
-                       name, success_count);
+                debug!(
+                    "Parallel {} succeeded - {} children succeeded (policy: AnySucceed)",
+                    name, success_count
+                );
                 NodeResult::Success
             } else {
-                debug!("Parallel {} failed - no children succeeded (policy: AnySucceed)", name);
+                debug!(
+                    "Parallel {} failed - no children succeeded (policy: AnySucceed)",
+                    name
+                );
                 NodeResult::Failure
             }
         }

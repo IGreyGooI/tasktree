@@ -34,29 +34,29 @@
 //! rt.tick().await;
 //! ```
 
-pub mod types;
 pub mod blackboard;
-pub mod error;
-pub mod node;
-pub mod tree;
-pub mod nodes;
-pub mod condition;
 pub mod builder;
-pub mod registry;
-pub mod tree_def;
+pub mod condition;
+pub mod error;
 #[cfg(feature = "lua")]
 pub mod lua;
+pub mod node;
+pub mod nodes;
 pub mod poll;
-pub mod utils;
+pub mod registry;
 pub mod runtime;
+pub mod tree;
+pub mod tree_def;
+pub mod types;
+pub mod utils;
 
 // Re-exports for convenience
 pub use blackboard::Blackboard;
+pub use builder::{BehaviorTreeBuilder, FunctionNode, IntoAsyncBehaviorNode};
+pub use condition::Condition;
 pub use error::RobotBTError;
-pub use builder::{BehaviorTreeBuilder, IntoAsyncBehaviorNode, FunctionNode};
+pub use node::AsyncBehaviorNode;
 pub use registry::BtRegistry;
+pub use runtime::BehaviorTreeRuntime;
 pub use tree::BehaviorTreeNode;
 pub use types::{ActionResult, AsyncExecutionContext, NodeResult, ParallelPolicy};
-pub use node::AsyncBehaviorNode;
-pub use condition::Condition;
-pub use runtime::BehaviorTreeRuntime;

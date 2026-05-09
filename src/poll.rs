@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 /// or `None` if it returned `Pending`.
 pub fn poll_once<F: Future + ?Sized>(mut fut: Pin<&mut F>) -> Option<F::Output> {
     let waker = std::task::Waker::noop();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(waker);
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(v) => Some(v),
         Poll::Pending => None,
