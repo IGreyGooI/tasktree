@@ -86,9 +86,9 @@
 //!   spawn).  If it returns `Pending`, the runtime spawns it and stores the
 //!   handle keyed by `NodeId`; the action's parent sees `Running`.
 //! * **Tick N** — if the handle is still alive, the runtime returns `Running`
-//!   without re-entering `execute`.  Conditions earlier in the tree are still
-//!   re-evaluated on every tick; sibling branches after a `Running` action are
-//!   not walked (selector / sequence short-circuit).
+//!   without re-entering `execute`. Composite nodes with memory semantics keep
+//!   resuming the same running child/branch on later ticks until it reaches a
+//!   terminal result or [`Self::interrupt`] resets the tree.
 //! * **Completion** — the handle reports `Ready(ActionResult)`; the runtime
 //!   removes it from the map and bubbles the result up.
 //!
@@ -129,6 +129,8 @@ pub struct BehaviorTreeRuntime<CTX> {
     cancellation_token: CancellationToken,
     /// In-flight action handles, keyed by stable `NodeId`.
     handles: HashMap<NodeId, JoinHandle<ActionResult>>,
+    /// Memory-style "currently running child/branch" pointers for composites.
+    active_children: HashMap<NodeId, usize>,
 }
 
 impl<CTX: Send + Sync + 'static> BehaviorTreeRuntime<CTX> {
@@ -143,6 +145,7 @@ impl<CTX: Send + Sync + 'static> BehaviorTreeRuntime<CTX> {
             user,
             cancellation_token: CancellationToken::new(),
             handles: HashMap::new(),
+            active_children: HashMap::new(),
         }
     }
 
@@ -198,6 +201,7 @@ impl<CTX: Send + Sync + 'static> BehaviorTreeRuntime<CTX> {
         for (_, handle) in self.handles.drain() {
             handle.abort();
         }
+        self.active_children.clear();
     }
 
     /// Pre-empt the running tree so the next `tick()` walks fresh from the root.
@@ -228,7 +232,7 @@ impl<CTX: Send + Sync + 'static> BehaviorTreeRuntime<CTX> {
             self.cancellation_token.clone(),
             Arc::clone(&self.user),
         );
-        eval(&self.root, &mut self.handles, ctx).await
+        eval(&self.root, &mut self.handles, &mut self.active_children, ctx).await
     }
 
     /// Abort all in-flight handles for `subtree` and its descendants.
@@ -236,7 +240,7 @@ impl<CTX: Send + Sync + 'static> BehaviorTreeRuntime<CTX> {
     /// Called by selector nodes when a higher-priority child succeeds and the
     /// currently-running lower-priority subtree should be preempted.
     pub fn cancel_subtree(&mut self, subtree: &BehaviorTreeNode<CTX>) {
-        cancel_subtree_handles(subtree, &mut self.handles);
+        cancel_subtree_state(subtree, &mut self.handles, &mut self.active_children);
     }
 }
 
@@ -247,6 +251,7 @@ impl<CTX: Send + Sync + 'static> BehaviorTreeRuntime<CTX> {
 fn eval<'a, CTX: Send + Sync + 'static>(
     node: &'a BehaviorTreeNode<CTX>,
     handles: &'a mut HashMap<NodeId, JoinHandle<ActionResult>>,
+    active_children: &'a mut HashMap<NodeId, usize>,
     ctx: AsyncExecutionContext<CTX>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = NodeResult> + Send + 'a>> {
     Box::pin(async move {
@@ -265,33 +270,56 @@ fn eval<'a, CTX: Send + Sync + 'static>(
             // ------------------------------------------------------------------
             // Sequence — stop on first failure
             // ------------------------------------------------------------------
-            BehaviorTreeNode::Sequence { name, children, .. } => {
+            BehaviorTreeNode::Sequence { id, name, children, .. } => {
                 trace!("Sequence {}", name);
-                for child in children {
-                    match eval(child, handles, ctx.child_context()).await {
-                        NodeResult::Success => continue,
-                        other => return other,
+                let start_index = active_children.get(id).copied().unwrap_or(0);
+                for (index, child) in children.iter().enumerate().skip(start_index) {
+                    match eval(child, handles, active_children, ctx.child_context()).await {
+                        NodeResult::Success => {
+                            active_children.remove(id);
+                            continue;
+                        }
+                        NodeResult::Failure => {
+                            active_children.remove(id);
+                            cancel_subtree_state(child, handles, active_children);
+                            return NodeResult::Failure;
+                        }
+                        NodeResult::Running => {
+                            active_children.insert(id.clone(), index);
+                            return NodeResult::Running;
+                        }
                     }
                 }
+                active_children.remove(id);
                 NodeResult::Success
             }
 
             // ------------------------------------------------------------------
             // Selector — stop on first success
             // ------------------------------------------------------------------
-            BehaviorTreeNode::Selector { name, children, .. } => {
+            BehaviorTreeNode::Selector { id, name, children, .. } => {
                 trace!("Selector {}", name);
-                for child in children {
-                    match eval(child, handles, ctx.child_context()).await {
+                let start_index = active_children.get(id).copied().unwrap_or(0);
+                for (index, child) in children.iter().enumerate().skip(start_index) {
+                    match eval(child, handles, active_children, ctx.child_context()).await {
                         NodeResult::Failure => {
+                            active_children.remove(id);
                             // Clean up any handles the child left in-flight
                             // before trying the next child.
-                            cancel_subtree_handles(child, handles);
+                            cancel_subtree_state(child, handles, active_children);
                             continue;
                         }
-                        other => return other,
+                        NodeResult::Success => {
+                            active_children.remove(id);
+                            return NodeResult::Success;
+                        }
+                        NodeResult::Running => {
+                            active_children.insert(id.clone(), index);
+                            return NodeResult::Running;
+                        }
                     }
                 }
+                active_children.remove(id);
                 NodeResult::Failure
             }
 
@@ -312,7 +340,7 @@ fn eval<'a, CTX: Send + Sync + 'static>(
                 let mut failures = 0usize;
                 let mut running = 0usize;
                 for child in children {
-                    match eval(child, handles, ctx.child_context()).await {
+                    match eval(child, handles, active_children, ctx.child_context()).await {
                         NodeResult::Success => successes += 1,
                         NodeResult::Failure => failures += 1,
                         NodeResult::Running => running += 1,
@@ -324,7 +352,7 @@ fn eval<'a, CTX: Send + Sync + 'static>(
                 // all sibling handles that are still in-flight.
                 if result != NodeResult::Running {
                     for child in children {
-                        cancel_subtree_handles(child, handles);
+                        cancel_subtree_state(child, handles, active_children);
                     }
                 }
                 result
@@ -334,6 +362,7 @@ fn eval<'a, CTX: Send + Sync + 'static>(
             // Condition — evaluate predicate, execute branch
             // ------------------------------------------------------------------
             BehaviorTreeNode::Condition {
+                id,
                 name,
                 condition,
                 true_branch,
@@ -341,16 +370,90 @@ fn eval<'a, CTX: Send + Sync + 'static>(
                 ..
             } => {
                 trace!("Condition {}", name);
-                if condition.evaluate(&ctx).await {
-                    eval(true_branch, handles, ctx).await
-                } else if let Some(fb) = false_branch {
-                    eval(fb, handles, ctx).await
-                } else {
-                    NodeResult::Failure
+                if let Some(active_branch) = active_children.get(id).copied() {
+                    let result = eval_condition_branch(
+                        id,
+                        active_branch,
+                        true_branch,
+                        false_branch.as_deref(),
+                        handles,
+                        active_children,
+                        ctx,
+                    )
+                    .await;
+                    if result != NodeResult::Running {
+                        active_children.remove(id);
+                    }
+                    return result;
                 }
+
+                let selected_branch = if condition.evaluate(&ctx).await {
+                    Some(0)
+                } else if false_branch.is_some() {
+                    Some(1)
+                } else {
+                    None
+                };
+
+                let Some(selected_branch) = selected_branch else {
+                    active_children.remove(id);
+                    return NodeResult::Failure;
+                };
+
+                let result = eval_condition_branch(
+                    id,
+                    selected_branch,
+                    true_branch,
+                    false_branch.as_deref(),
+                    handles,
+                    active_children,
+                    ctx,
+                )
+                .await;
+                if result != NodeResult::Running {
+                    active_children.remove(id);
+                }
+                result
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// eval_condition_branch
+// ---------------------------------------------------------------------------
+
+async fn eval_condition_branch<CTX: Send + Sync + 'static>(
+    id: &NodeId,
+    branch_index: usize,
+    true_branch: &BehaviorTreeNode<CTX>,
+    false_branch: Option<&BehaviorTreeNode<CTX>>,
+    handles: &mut HashMap<NodeId, JoinHandle<ActionResult>>,
+    active_children: &mut HashMap<NodeId, usize>,
+    ctx: AsyncExecutionContext<CTX>,
+) -> NodeResult {
+    let branch = match branch_index {
+        0 => true_branch,
+        1 => match false_branch {
+            Some(branch) => branch,
+            None => {
+                active_children.remove(id);
+                return NodeResult::Failure;
+            }
+        },
+        _ => {
+            active_children.remove(id);
+            return NodeResult::Failure;
+        }
+    };
+
+    match eval(branch, handles, active_children, ctx).await {
+        NodeResult::Running => {
+            active_children.insert(id.clone(), branch_index);
+            NodeResult::Running
+        }
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -440,18 +543,20 @@ fn apply_parallel_policy(
 }
 
 // ---------------------------------------------------------------------------
-// cancel_subtree_handles
+// cancel_subtree_state
 // ---------------------------------------------------------------------------
 
-fn cancel_subtree_handles<CTX: Send + Sync + 'static>(
+fn cancel_subtree_state<CTX: Send + Sync + 'static>(
     node: &BehaviorTreeNode<CTX>,
     handles: &mut HashMap<NodeId, JoinHandle<ActionResult>>,
+    active_children: &mut HashMap<NodeId, usize>,
 ) {
+    active_children.remove(node.id());
     if let Some(h) = handles.remove(node.id()) {
         h.abort();
     }
     for child in node.children() {
-        cancel_subtree_handles(child, handles);
+        cancel_subtree_state(child, handles, active_children);
     }
     if let BehaviorTreeNode::Condition {
         true_branch,
@@ -459,9 +564,9 @@ fn cancel_subtree_handles<CTX: Send + Sync + 'static>(
         ..
     } = node
     {
-        cancel_subtree_handles(true_branch, handles);
+        cancel_subtree_state(true_branch, handles, active_children);
         if let Some(fb) = false_branch {
-            cancel_subtree_handles(fb, handles);
+            cancel_subtree_state(fb, handles, active_children);
         }
     }
 }
@@ -474,11 +579,15 @@ fn cancel_subtree_handles<CTX: Send + Sync + 'static>(
 mod tests {
     use super::*;
     use crate::blackboard::Blackboard;
+    use crate::condition::Condition;
     use crate::node::AsyncBehaviorNode;
     use crate::tree::BehaviorTreeNode;
     use crate::types::{ActionResult, AsyncExecutionContext, NodeResult};
     use async_trait::async_trait;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     // --- helpers ---
 
@@ -562,6 +671,20 @@ mod tests {
         }
         fn name(&self) -> &str {
             "CountedSuccess"
+        }
+    }
+
+    #[derive(Debug)]
+    struct FlagCondition(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl Condition<()> for FlagCondition {
+        async fn evaluate(&self, _ctx: &AsyncExecutionContext<()>) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+
+        fn name(&self) -> &str {
+            "FlagCondition"
         }
     }
 
@@ -697,6 +820,62 @@ mod tests {
 
         assert_eq!(rt.tick().await, NodeResult::Success);
         assert!(rt.handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn selector_remembers_running_child_across_ticks() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let root = BehaviorTreeNode::Selector {
+            id: NodeId::root("sel"),
+            name: "sel".into(),
+            children: vec![
+                BehaviorTreeNode::Condition {
+                    id: NodeId::root("gate"),
+                    name: "gate".into(),
+                    condition: Arc::new(FlagCondition(flag.clone())),
+                    true_branch: Box::new(action_node(AlwaysSuccess)),
+                    false_branch: None,
+                },
+                action_node(DelayedSuccess),
+            ],
+        };
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
+
+        assert_eq!(rt.tick().await, NodeResult::Running);
+        flag.store(true, Ordering::SeqCst);
+
+        assert_eq!(rt.tick().await, NodeResult::Running);
+        assert_eq!(rt.handles.len(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(rt.tick().await, NodeResult::Success);
+        assert!(rt.handles.is_empty());
+        assert!(rt.active_children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn condition_locks_running_branch_until_terminal() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let root = BehaviorTreeNode::Condition {
+            id: NodeId::root("gate"),
+            name: "gate".into(),
+            condition: Arc::new(FlagCondition(flag.clone())),
+            true_branch: Box::new(action_node(DelayedSuccess)),
+            false_branch: None,
+        };
+        let mut rt = BehaviorTreeRuntime::new(root, Blackboard::new(), Arc::new(()));
+
+        assert_eq!(rt.tick().await, NodeResult::Running);
+        flag.store(false, Ordering::SeqCst);
+
+        assert_eq!(rt.tick().await, NodeResult::Running);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(rt.tick().await, NodeResult::Success);
+        assert!(rt.handles.is_empty());
+        assert!(rt.active_children.is_empty());
     }
 
     #[tokio::test]
