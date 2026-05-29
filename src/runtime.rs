@@ -232,7 +232,13 @@ impl<CTX: Send + Sync + 'static> BehaviorTreeRuntime<CTX> {
             self.cancellation_token.clone(),
             Arc::clone(&self.user),
         );
-        eval(&self.root, &mut self.handles, &mut self.active_children, ctx).await
+        eval(
+            &self.root,
+            &mut self.handles,
+            &mut self.active_children,
+            ctx,
+        )
+        .await
     }
 
     /// Abort all in-flight handles for `subtree` and its descendants.
@@ -270,7 +276,9 @@ fn eval<'a, CTX: Send + Sync + 'static>(
             // ------------------------------------------------------------------
             // Sequence — stop on first failure
             // ------------------------------------------------------------------
-            BehaviorTreeNode::Sequence { id, name, children, .. } => {
+            BehaviorTreeNode::Sequence {
+                id, name, children, ..
+            } => {
                 trace!("Sequence {}", name);
                 let start_index = active_children.get(id).copied().unwrap_or(0);
                 for (index, child) in children.iter().enumerate().skip(start_index) {
@@ -297,7 +305,9 @@ fn eval<'a, CTX: Send + Sync + 'static>(
             // ------------------------------------------------------------------
             // Selector — stop on first success
             // ------------------------------------------------------------------
-            BehaviorTreeNode::Selector { id, name, children, .. } => {
+            BehaviorTreeNode::Selector {
+                id, name, children, ..
+            } => {
                 trace!("Selector {}", name);
                 let start_index = active_children.get(id).copied().unwrap_or(0);
                 for (index, child) in children.iter().enumerate().skip(start_index) {
